@@ -1,6 +1,6 @@
 from datasets import load_dataset, Dataset
 
-from data.format.prompts import PROMPT
+from data.format.prompts import PROMPT, MATH_PROMPT
 from data.utils.math import process_gsm8k
 
 PROBLEM_KEY = {
@@ -8,14 +8,16 @@ PROBLEM_KEY = {
     "math-ai/aime24":"problem",
     "math-ai/amc23":"question",
     "math-ai/math500":"problem",
-    "openai/gsm8k": "question"
+    "openai/gsm8k": "question",
+    "POLARIS-Project/Polaris-Dataset-53K": "problem"
 }
 ANSWER_KEY = {
     "math-ai/aime25": "answer",
     "math-ai/aime24":"solution",
     "math-ai/amc23":"answer",
     "math-ai/math500":"answer",
-    "openai/gsm8k": "answer"
+    "openai/gsm8k": "answer",
+    "POLARIS-Project/Polaris-Dataset-53K": "answer"
 }
 
 
@@ -25,16 +27,18 @@ def _format_math(ex, dataset_name: str) -> dict:
         "dataset": dataset_name.split("/")[1],
         "description": ex[PROBLEM_KEY[dataset_name]],
         "problem": ex[PROBLEM_KEY[dataset_name]],
-        "prompt": PROMPT.format(problem=ex[PROBLEM_KEY[dataset_name]]),
+        "prompt": MATH_PROMPT.format(problem=ex[PROBLEM_KEY[dataset_name]]),
         "answer": str(ex[ANSWER_KEY[dataset_name]]),
     }
 
 
 def load_math(dataset_name: str) -> Dataset:
-    assert dataset_name in ["math-ai/aime24", "math-ai/aime25", "math-ai/math500", "math-ai/amc23", "openai/gsm8k"]
+    assert dataset_name in ["math-ai/aime24", "math-ai/aime25", "math-ai/math500", "math-ai/amc23", "openai/gsm8k", "POLARIS-Project/Polaris-Dataset-53K"]
 
     if dataset_name == "openai/gsm8k":
         ds = load_dataset("openai/gsm8k", "main", split="test")
+    elif dataset_name == "POLARIS-Project/Polaris-Dataset-53K":
+        ds = load_dataset(dataset_name, split="train")
     else:
         ds = load_dataset(dataset_name, split="test")
 

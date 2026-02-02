@@ -12,6 +12,15 @@ export PYTHONPATH=/users/$USER/SDPO:$PYTHONPATH
 
 * LiveCodeBench v6: `python data/load_dataset.py --dataset_name livecodebench/code_generation_lite-v6 --output_path datasets/lcb_v6.json`
 
+## Math Datasets
+
+* Polaris-Dataset-53K: `python data/load_dataset.py --dataset_name POLARIS-Project/Polaris-Dataset-53K --output_path datasets/polaris_53k.json`
+* AIME 2024: `python data/load_dataset.py --dataset_name math-ai/aime24 --output_path datasets/aime24.json`
+* AIME 2025: `python data/load_dataset.py --dataset_name math-ai/aime25 --output_path datasets/aime25.json`
+* MATH 500: `python data/load_dataset.py --dataset_name math-ai/math500 --output_path datasets/math500.json`
+* AMC 2023: `python data/load_dataset.py --dataset_name math-ai/amc23 --output_path datasets/amc23.json`
+* GSM8K: `python data/load_dataset.py --dataset_name openai/gsm8k --output_path datasets/gsm8k.json`
+
 ## Generalization Experiments
 
 * tooluse: the json files are already provided in `datasets/tooluse/train.json` and `datasets/tooluse/test.json`
@@ -48,6 +57,13 @@ python data/split_tasks.py \
 python data/split_tasks.py \
     --json_path datasets/physics.json \
     --output_dir datasets/sciknoweval/physics
+
+python data/split_tasks.py \
+    --json_path datasets/polaris_53k.json \
+    --output_dir datasets/polaris_53k \
+    --test_ratio 0.019 \
+    --seed 42
+
 ```
 
 ## Prepocessing

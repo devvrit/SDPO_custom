@@ -1,4 +1,5 @@
 PROMPT = "{problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+MATH_PROMPT= "Solve the following math problem. Make sure to put the answer (and only answer) inside \\boxed{{}}.\n\n{problem}"
 
 CODE_PROMPT = """You are a coding expert. You will be given a coding problem, and you need to write a correct Python program that matches the specification and passes all tests. The time limit is 1 second. You may start by outlining your thought process. In the end, please provide the complete code in a code block enclosed with ``` ```.\n\n{problem}"""
 

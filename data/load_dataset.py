@@ -41,7 +41,7 @@ def load_dataset_hf(
         ds = load_gpqa(category)
     elif dataset_name == "TIGER-Lab/MMLU-Pro":
         ds = load_mmlu_pro(category, implementation="evalchemy")
-    elif dataset_name in ["math-ai/aime24", "math-ai/aime25", "math-ai/math500", "math-ai/amc23", "openai/gsm8k"]:
+    elif dataset_name in ["math-ai/aime24", "math-ai/aime25", "math-ai/math500", "math-ai/amc23", "openai/gsm8k", "POLARIS-Project/Polaris-Dataset-53K"]:
         ds = load_math(dataset_name)
     elif dataset_name in ["open-r1/codeforces", "Qwen/CodeElo", "livecodebench/code_generation_lite-v6", "evalplus/humanevalplus", "evalplus/mbppplus"]:
         ds = load_code(dataset_name)
