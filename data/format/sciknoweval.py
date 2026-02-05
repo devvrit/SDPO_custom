@@ -49,6 +49,10 @@ def load_sciknoweval(
     if level:
         ds = ds.filter(lambda x: x['details']['level'] == level)
 
+    print(f"Len ds:{len(ds)}")
+    ds = ds.filter(lambda x: x['type'] == 'mcq-4-choices')
+    print(f"Len ds after filtering:{len(ds)}")
+
     original_columns = ds.column_names
     return ds.map(format, remove_columns=original_columns)
 

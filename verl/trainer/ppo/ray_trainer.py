@@ -541,6 +541,33 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _maybe_log_val_generations_raw(self, inputs, outputs, scores):
+        """Print validation samples with chat template / special tokens preserved."""
+
+        generations_to_log = self.config.trainer.log_val_generations
+
+        if generations_to_log == 0:
+            return
+
+        import numpy as np
+
+        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x[0])
+
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+
+        samples = samples[:generations_to_log]
+
+        print("=" * 80)
+        print(f"VAL GENERATIONS (RAW, with special tokens) — step {self.global_steps}")
+        print("=" * 80)
+        for i, (inp, out, score) in enumerate(samples):
+            print(f"--- Sample {i + 1} (score={score}) ---")
+            print(f"INPUT:\n{inp}")
+            print(f"OUTPUT:\n{out}")
+        print("=" * 80)
+
     def _compute_or_extract_reward(
         self,
         batch: DataProto,
@@ -819,6 +846,8 @@ class RayPPOTrainer:
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
+        sample_inputs_raw = []
+        sample_outputs_raw = []
         sample_gts = []
         sample_scores = []
         sample_turns = []
@@ -878,15 +907,18 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            output_texts_raw = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in output_ids]
+            sample_outputs_raw.extend(output_texts_raw)
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
-            # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+            input_texts_raw = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in input_ids]
+            sample_inputs_raw.extend(input_texts_raw)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
             # evaluate using reward_function
@@ -912,6 +944,7 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations_raw(inputs=sample_inputs_raw, outputs=sample_outputs_raw, scores=sample_scores)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
