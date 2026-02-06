@@ -124,6 +124,15 @@ self_distillation:
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
+  # Weight for RL policy gradient loss combined with SDPO: L = L_sdpo + rl_loss_coef * L_RL
+  rl_loss_coef: 0.0
+
+  # Whether to normalize per-token SDPO losses by std before aggregation
+  std_normalize_sdpo: false
+
+  # Epsilon for std normalization
+  std_normalize_eps: 1.0e-8
+
   # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
   reprompt_template: |-
     {prompt}{solution}{feedback}

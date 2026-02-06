@@ -88,6 +88,9 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    rl_loss_coef: float = 0.0
+    std_normalize_sdpo: bool = False
+    std_normalize_eps: float = 1e-8
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

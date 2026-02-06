@@ -18,6 +18,8 @@ actor_rollout_ref:
     self_distillation:
       max_reprompt_len: 10240
       is_clip: 2.0
+      rl_loss_coef: 0.1
+      std_normalize_sdpo: true
     optim:
       lr: 1e-5
   rollout:
@@ -25,7 +27,7 @@ actor_rollout_ref:
     calculate_log_probs: True
 
 algorithm:
-  adv_estimator: grpo # disables critic
+  adv_estimator: grpo_hybrid # center per-group, normalize by global batch std
   norm_adv_by_std_in_grpo: False
   rollout_correction:
     rollout_is: token

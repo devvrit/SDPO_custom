@@ -803,7 +803,7 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                        pg_loss, pg_metrics = compute_self_distillation_loss(
+                        sdpo_loss, sdpo_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
                             teacher_log_probs=teacher_log_prob,
                             response_mask=response_mask,
@@ -818,8 +818,30 @@ class DataParallelPPOActor(BasePPOActor):
                             rollout_is_weights=rollout_is_weights,
                         )
 
-                        pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
-                        micro_batch_metrics.update(pg_metrics)
+                        sdpo_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                        micro_batch_metrics.update(sdpo_metrics)
+                        micro_batch_metrics["actor/sdpo_loss"] = sdpo_loss.detach().item()
+
+                        # Optionally add RL policy gradient loss: L = L_sdpo + rl_loss_coef * L_RL
+                        rl_loss_coef = getattr(self_distillation_cfg, "rl_loss_coef", 0.0)
+                        if rl_loss_coef > 0.0:
+                            rl_policy_loss_fn = get_policy_loss_fn("vanilla")
+                            rl_loss, rl_metrics = rl_policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                            for k, v in rl_metrics.items():
+                                micro_batch_metrics[f"rl/{k.split('/')[-1]}"] = v
+                            micro_batch_metrics["actor/rl_loss"] = rl_loss.detach().item()
+                            micro_batch_metrics["actor/rl_loss_coef"] = rl_loss_coef
+                            pg_loss = sdpo_loss + rl_loss_coef * rl_loss
+                        else:
+                            pg_loss = sdpo_loss
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov

@@ -359,6 +359,50 @@ def compute_grpo_vectorized_outcome_advantage(
         return advantages, advantages
 
 
+@register_adv_est("grpo_hybrid")
+def compute_grpo_hybrid_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Hybrid GRPO advantage: center per uid-group, normalize by global batch std.
+
+    advantage_i = (r_i - r_mean_group_i) / (r_std_batch + epsilon)
+
+    This separates the centering (per-group, removing prompt difficulty bias)
+    from the scaling (global, ensuring consistent gradient magnitude).
+    """
+    scores = token_level_rewards.sum(dim=-1)  # (bs,)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+
+        # Per-group means (same as standard GRPO)
+        id2score = defaultdict(list)
+        id2mean = {}
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+            else:
+                id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
+
+        # Global std across ALL rewards in the batch
+        global_std = torch.std(scores) if bsz > 1 else torch.tensor(1.0)
+
+        for i in range(bsz):
+            scores[i] = (scores[i] - id2mean[index[i]]) / (global_std + epsilon)
+
+        advantages = scores.unsqueeze(-1) * response_mask
+
+    return advantages, advantages
+
+
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
 def compute_grpo_passk_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -1178,6 +1222,17 @@ def compute_self_distillation_loss(
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
+
+    # Normalize per-token losses by their std across valid tokens in the batch
+    if getattr(self_distillation_config, "std_normalize_sdpo", False):
+        eps = getattr(self_distillation_config, "std_normalize_eps", 1e-8)
+        valid_losses = per_token_loss[loss_mask.bool()]
+        if valid_losses.numel() > 1:
+            loss_std = valid_losses.std().detach()
+        else:
+            loss_std = torch.tensor(1.0, device=per_token_loss.device, dtype=per_token_loss.dtype)
+        per_token_loss = per_token_loss / (loss_std + eps)
+        metrics["self_distillation/loss_std"] = loss_std.item()
 
     loss = agg_loss(
         loss_mat=per_token_loss,
