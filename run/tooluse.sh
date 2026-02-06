@@ -81,7 +81,9 @@ vars.log_dir=$LOG_DIR \
 vars.ckpt_dir=$CKPT_DIR \
 vars.task=$DATA_PATH \
 custom_reward_function.path=$CUSTOM_REWARD_PATH \
-actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+actor_rollout_ref.actor.fsdp_config.param_offload=false"
 
 
 echo "----------------------------------------------------------------"
