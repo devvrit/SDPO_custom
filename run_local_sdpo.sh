@@ -48,6 +48,7 @@ trainer.group_name=SDPO-local \
 actor_rollout_ref.rollout.n=$ROLLOUT_BATCH_SIZE \
 actor_rollout_ref.model.path=$MODEL_PATH \
 actor_rollout_ref.actor.optim.lr=$LR \
+trainer.n_gpus_per_node=4 \
 actor_rollout_ref.actor.ppo_mini_batch_size=32 \
 actor_rollout_ref.actor.self_distillation.distillation_topk=100 \
 algorithm.rollout_correction.rollout_is=token \

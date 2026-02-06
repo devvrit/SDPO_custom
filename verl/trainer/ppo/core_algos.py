@@ -1231,7 +1231,13 @@ def compute_self_distillation_loss(
             loss_std = valid_losses.std().detach()
         else:
             loss_std = torch.tensor(1.0, device=per_token_loss.device, dtype=per_token_loss.dtype)
+        # Log pre-normalization mean (use 0.0 when no valid tokens to keep metrics consistent across micro-batches)
+        pre_norm_mean = valid_losses.mean().detach().item() if valid_losses.numel() > 0 else 0.0
+        metrics["self_distillation/sdpo_loss_pre_norm"] = pre_norm_mean
         per_token_loss = per_token_loss / (loss_std + eps)
+        # Log post-normalization mean and std used
+        post_norm_mean = per_token_loss[loss_mask.bool()].mean().detach().item() if valid_losses.numel() > 0 else 0.0
+        metrics["self_distillation/sdpo_loss_post_norm"] = post_norm_mean
         metrics["self_distillation/loss_std"] = loss_std.item()
 
     loss = agg_loss(

@@ -115,9 +115,9 @@ fi
 
 # Build partition-specific Hydra args
 PARTITION_ARGS=""
-# if [ "$PARTITION" = "mi2508x" ]; then
-#     PARTITION_ARGS="actor_rollout_ref.actor.fsdp_config.optimizer_offload=true actor_rollout_ref.actor.fsdp_config.param_offload=true actor_rollout_ref.rollout.gpu_memory_utilization=0.45"
-# fi
+if [ "$PARTITION" = "mi2508x" ]; then
+    PARTITION_ARGS="actor_rollout_ref.actor.fsdp_config.optimizer_offload=true actor_rollout_ref.actor.fsdp_config.param_offload=true actor_rollout_ref.rollout.gpu_memory_utilization=0.45"
+fi
 
 # Build multi-node Hydra args
 MULTINODE_ARGS=""

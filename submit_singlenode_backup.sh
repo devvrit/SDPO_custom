@@ -4,7 +4,7 @@
 # General SDPO Job Submission Script
 #
 # Usage:
-#   ./submit.sh -p PARTITION -c CONFIG -s SUFFIX [-n NNODES] [-m MODEL] [-d DATA] [-e EXP_NAME] [-r] [extra hydra args...]
+#   ./submit.sh -p PARTITION -c CONFIG -s SUFFIX [-m MODEL] [-d DATA] [-r] [extra hydra args...]
 #
 # Examples:
 #   ./submit.sh -p mi2508x -c general -s exp1
@@ -13,17 +13,13 @@
 #   ./submit.sh -p mi2508x -c general -s exp3 -r                          # auto-requeue on timeout
 #   ./submit.sh -p mi2508x -c general -s exp3 -m allenai/OLMo-3-7B-Instruct
 #   ./submit.sh -p mi2508x -c general -s exp3 actor_rollout_ref.actor.optim.lr=1e-6
-#   ./submit.sh -p mi2508x -c general -s exp3 -n 2                        # multi-node (2 nodes)
-#   ./submit.sh -p mi2508x -c general -s exp3 -e "OLD-EXP-NAME"           # resume old run
 #
 # Flags:
 #   -p  SLURM partition (e.g., mi2508x, mi3258x)
 #   -c  Run script name from run_scripts/ (e.g., general, general_rl_coef)
 #   -s  Experiment suffix (used in job name and passed to run script)
-#   -n  Number of nodes (default: 1; multi-node uses Ray cluster via _multinode_worker.sh)
 #   -m  Model path (default: Qwen/Qwen3-8B)
 #   -d  Data path (default: datasets/tooluse)
-#   -e  Experiment name override (for resuming old runs with different naming)
 #   -r  Auto-requeue: resubmit the job when approaching the time limit
 #
 # Partition-specific behavior:
@@ -37,7 +33,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-    echo "Usage: ./submit.sh -p PARTITION -c CONFIG -s SUFFIX [-n NNODES] [-m MODEL] [-d DATA] [-e EXP_NAME] [-r] [extra hydra args...]"
+    echo "Usage: ./submit.sh -p PARTITION -c CONFIG -s SUFFIX [-m MODEL] [-d DATA] [-r] [extra hydra args...]"
     echo ""
     echo "Required flags:"
     echo "  -p  SLURM partition (e.g., mi2508x, mi3258x)"
@@ -45,10 +41,8 @@ usage() {
     echo "  -s  Experiment suffix"
     echo ""
     echo "Optional flags:"
-    echo "  -n  Number of nodes (default: 1; >= 2 enables multi-node Ray cluster)"
     echo "  -m  Model path (default: Qwen/Qwen3-8B)"
     echo "  -d  Data path (default: datasets/tooluse)"
-    echo "  -e  Experiment name override (for resuming old runs with different naming)"
     echo "  -r  Auto-requeue on time limit (resubmits with same args)"
     echo ""
     echo "Available run scripts:"
@@ -60,21 +54,17 @@ usage() {
 PARTITION="mi2508x"
 CONFIG="general"
 SUFFIX="$(date +%d%m_%H%M)"
-NNODES=1
 MODEL="Qwen/Qwen3-8B"
 DATA="datasets/tooluse"
-EXP_NAME_OVERRIDE=""
 REQUEUE=false
 
-while getopts "p:c:s:n:m:d:e:r" opt; do
+while getopts "p:c:s:m:d:r" opt; do
     case $opt in
         p) PARTITION="$OPTARG" ;;
         c) CONFIG="$OPTARG" ;;
         s) SUFFIX="$OPTARG" ;;
-        n) NNODES="$OPTARG" ;;
         m) MODEL="$OPTARG" ;;
         d) DATA="$OPTARG" ;;
-        e) EXP_NAME_OVERRIDE="$OPTARG" ;;
         r) REQUEUE=true ;;
         *) usage ;;
     esac
@@ -91,12 +81,6 @@ if [ -z "$PARTITION" ] || [ -z "$CONFIG" ] || [ -z "$SUFFIX" ]; then
     usage
 fi
 
-# Validate NNODES
-if ! [[ "$NNODES" =~ ^[0-9]+$ ]] || [ "$NNODES" -lt 1 ]; then
-    echo "Error: -n must be a positive integer (got: $NNODES)"
-    exit 1
-fi
-
 # Validate run script exists
 RUN_SCRIPT="run_scripts/${CONFIG}.sh"
 if [ ! -f "${SCRIPT_DIR}/${RUN_SCRIPT}" ]; then
@@ -107,31 +91,16 @@ if [ ! -f "${SCRIPT_DIR}/${RUN_SCRIPT}" ]; then
     exit 1
 fi
 
-# Validate worker script exists for multi-node
-if [ "$NNODES" -ge 2 ] && [ ! -f "${SCRIPT_DIR}/_multinode_worker.sh" ]; then
-    echo "Error: _multinode_worker.sh not found in ${SCRIPT_DIR} (required for multi-node)"
-    exit 1
-fi
-
 # Build partition-specific Hydra args
 PARTITION_ARGS=""
-# if [ "$PARTITION" = "mi2508x" ]; then
-#     PARTITION_ARGS="actor_rollout_ref.actor.fsdp_config.optimizer_offload=true actor_rollout_ref.actor.fsdp_config.param_offload=true actor_rollout_ref.rollout.gpu_memory_utilization=0.45"
-# fi
-
-# Build multi-node Hydra args
-MULTINODE_ARGS=""
-if [ "$NNODES" -ge 2 ]; then
-    MULTINODE_ARGS="trainer.nnodes=$NNODES +ray_kwargs.ray_init.address=auto actor_rollout_ref.actor.fsdp_config.fsdp_size=8"
+if [ "$PARTITION" = "mi2508x" ]; then
+    PARTITION_ARGS="actor_rollout_ref.actor.fsdp_config.optimizer_offload=true actor_rollout_ref.actor.fsdp_config.param_offload=true actor_rollout_ref.rollout.gpu_memory_utilization=0.45"
 fi
 
-# Combine all extra Hydra args: partition + multinode + user
+# Combine all extra Hydra args: partition-specific + user-provided
 EXTRA_HYDRA_ARGS=""
 if [ -n "$PARTITION_ARGS" ]; then
     EXTRA_HYDRA_ARGS="$PARTITION_ARGS"
-fi
-if [ -n "$MULTINODE_ARGS" ]; then
-    EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:+$EXTRA_HYDRA_ARGS }$MULTINODE_ARGS"
 fi
 if [ -n "$USER_EXTRA_ARGS" ]; then
     EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:+$EXTRA_HYDRA_ARGS }$USER_EXTRA_ARGS"
@@ -143,29 +112,17 @@ MODEL_SHORT=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
 # Short data name for job name (e.g. datasets/sciknoweval/physics/ -> physics)
 DATA_SHORT=$(basename "${DATA%/}")
 
-# Job name: data-config-model-partition[-Nn]-suffix
-if [ "$NNODES" -ge 2 ]; then
-    JOB_NAME="${DATA_SHORT}-${CONFIG}-${MODEL_SHORT}-${PARTITION}-${NNODES}n-${SUFFIX}"
-else
-    JOB_NAME="${DATA_SHORT}-${CONFIG}-${MODEL_SHORT}-${PARTITION}-${SUFFIX}"
-fi
+# Job name: data-config-model-partition-suffix
+JOB_NAME="${DATA_SHORT}-${CONFIG}-${MODEL_SHORT}-${PARTITION}-${SUFFIX}"
 
 # Create logs directory
 mkdir -p "${SCRIPT_DIR}/logs"
 
 echo "============================================"
-if [ "$NNODES" -ge 2 ]; then
-    echo "Submitting Multi-Node SDPO Training Job"
-else
-    echo "Submitting SDPO Training Job"
-fi
+echo "Submitting SDPO Training Job"
 echo "============================================"
 echo "Job name:   $JOB_NAME"
 echo "Partition:  $PARTITION"
-if [ "$NNODES" -ge 2 ]; then
-    echo "Nodes:      $NNODES"
-    echo "GPUs:       $((NNODES * 8))"
-fi
 echo "Config:     $CONFIG"
 echo "Suffix:     $SUFFIX"
 echo "Model:      $MODEL"
@@ -175,9 +132,6 @@ if [ -n "$PARTITION_ARGS" ]; then
     echo "Offloading: enabled (mi2508x)"
 else
     echo "Offloading: disabled"
-fi
-if [ -n "$EXP_NAME_OVERRIDE" ]; then
-    echo "Exp name:   $EXP_NAME_OVERRIDE (override)"
 fi
 if [ -n "$USER_EXTRA_ARGS" ]; then
     echo "Extra args: $USER_EXTRA_ARGS"
@@ -191,12 +145,13 @@ echo "============================================"
 SBATCH_FLAGS=(
     --job-name="$JOB_NAME"
     --partition="$PARTITION"
-    --nodes="$NNODES"
+    --nodes=1
     --ntasks-per-node=1
     --exclusive
     --time=12:00:00
     --output="${SCRIPT_DIR}/logs/${JOB_NAME}_%j.log"
     --error="${SCRIPT_DIR}/logs/${JOB_NAME}_%j.err"
+    --export="ALL,EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS},MODEL_PATH=${MODEL},DATA_PATH=${DATA}"
 )
 
 # If requeue enabled, tell SLURM to send SIGUSR1 120s before time limit
@@ -205,28 +160,11 @@ if [ "$REQUEUE" = true ]; then
 fi
 
 # Build the requeue command that the job will use to resubmit itself
-REQUEUE_CMD="${SCRIPT_DIR}/submit.sh -p ${PARTITION} -c ${CONFIG} -s ${SUFFIX} -n ${NNODES} -m ${MODEL} -d ${DATA}"
-if [ -n "$EXP_NAME_OVERRIDE" ]; then
-    REQUEUE_CMD="$REQUEUE_CMD -e '${EXP_NAME_OVERRIDE}'"
-fi
-if [ "$REQUEUE" = true ]; then
-    REQUEUE_CMD="$REQUEUE_CMD -r"
-fi
-if [ -n "$USER_EXTRA_ARGS" ]; then
-    REQUEUE_CMD="$REQUEUE_CMD $USER_EXTRA_ARGS"
-fi
+REQUEUE_CMD="${SCRIPT_DIR}/submit.sh -p ${PARTITION} -c ${CONFIG} -s ${SUFFIX} -m ${MODEL} -d ${DATA} -r ${USER_EXTRA_ARGS}"
 
 # Submit to SLURM
-if [ "$NNODES" -ge 2 ]; then
-    # Multi-node: use _multinode_worker.sh (handles Ray cluster setup)
-    sbatch "${SBATCH_FLAGS[@]}" \
-        --export="ALL,SCRIPT_DIR=${SCRIPT_DIR},RUN_SCRIPT=${RUN_SCRIPT},SUFFIX=${SUFFIX},EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS},MODEL_PATH=${MODEL},DATA_PATH=${DATA},JOB_NAME=${JOB_NAME},EXP_NAME_OVERRIDE=${EXP_NAME_OVERRIDE},REQUEUE=${REQUEUE},REQUEUE_CMD=${REQUEUE_CMD}" \
-        "${SCRIPT_DIR}/_multinode_worker.sh"
-else
-    # Single-node: inline sbatch script
-    sbatch "${SBATCH_FLAGS[@]}" \
-        --export="ALL,EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS},MODEL_PATH=${MODEL},DATA_PATH=${DATA},JOB_NAME=${JOB_NAME},EXP_NAME_OVERRIDE=${EXP_NAME_OVERRIDE}" \
-        <<EOF
+# EXTRA_HYDRA_ARGS is exported so the run script picks it up via its EXTRA_HYDRA_ARGS check
+sbatch "${SBATCH_FLAGS[@]}" <<EOF
 #!/bin/bash
 
 echo "============================================"
@@ -264,4 +202,3 @@ echo "============================================"
 echo "Training complete!"
 echo "============================================"
 EOF
-fi

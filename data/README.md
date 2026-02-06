@@ -25,7 +25,7 @@ export PYTHONPATH=/users/$USER/SDPO:$PYTHONPATH
 
 * tooluse: the json files are already provided in `datasets/tooluse/train.json` and `datasets/tooluse/test.json`
 * sciknoweval Biology: `python data/load_dataset.py --dataset_name Biology --output_path datasets/sciknoweval/biology/biology.json`
-* sciknoweval Chemistry: `python data/load_dataset.py --dataset_name Chemistry --output_path datasets/sciknoweval/chemistry/chemistry.json`
+* sciknoweval Chemistry: `dapython ta/load_dataset.py --dataset_name Chemistry --output_path datasets/sciknoweval/chemistry/chemistry.json`
 * sciknoweval Material: `python data/load_dataset.py --dataset_name Material --output_path datasets/sciknoweval/material/material.json`
 * sciknoweval Physics: `python data/load_dataset.py --dataset_name Physics --output_path datasets/sciknoweval/physics/physics.json`
 
