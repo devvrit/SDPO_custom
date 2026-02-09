@@ -168,6 +168,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/min": reward_min,
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
+        "critic/advantages/abs_mean": torch.mean(valid_adv.abs()).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
         # returns

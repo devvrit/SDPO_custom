@@ -723,6 +723,8 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
+        if self_distillation_enabled and "uid" in data.non_tensor_batch.keys() and "uid" not in non_tensor_select_keys:
+            non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -843,6 +845,7 @@ class DataParallelPPOActor(BasePPOActor):
                             self_distillation_mask=self_distillation_mask,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
+                            index=model_inputs.get("uid"),
                         )
 
                         sdpo_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0

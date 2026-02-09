@@ -15,6 +15,7 @@
 #   ./submit.sh -p mi2508x -c general -s exp3 actor_rollout_ref.actor.optim.lr=1e-6
 #   ./submit.sh -p mi2508x -c general -s exp3 -n 2                        # multi-node (2 nodes)
 #   ./submit.sh -p mi2508x -c general -s exp3 -e "OLD-EXP-NAME"           # resume old run
+#   ./submit.sh -p mi3008x -c general -s exp1 ray_kwargs.ray_init.num_cpus=64
 #
 # Flags:
 #   -p  SLURM partition (e.g., mi2508x, mi3258x)
@@ -115,9 +116,9 @@ fi
 
 # Build partition-specific Hydra args
 PARTITION_ARGS=""
-# if [ "$PARTITION" = "mi2508x" ]; then
-#     PARTITION_ARGS="actor_rollout_ref.actor.fsdp_config.optimizer_offload=true actor_rollout_ref.actor.fsdp_config.param_offload=true actor_rollout_ref.rollout.gpu_memory_utilization=0.45"
-# fi
+if [ "$PARTITION" = "mi3008x" ]; then
+    PARTITION_ARGS="ray_kwargs.ray_init.num_cpus=64"
+fi
 
 # Build multi-node Hydra args
 MULTINODE_ARGS=""

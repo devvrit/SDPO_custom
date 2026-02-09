@@ -1139,6 +1139,7 @@ def compute_self_distillation_loss(
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    index: Optional[np.ndarray] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1223,22 +1224,54 @@ def compute_self_distillation_loss(
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
 
-    # Normalize per-token losses by their std across valid tokens in the batch
+    # Normalize per-token losses: subtract per-group mean, divide by global batch std
+    # (analogous to how grpo_hybrid computes advantages)
     if getattr(self_distillation_config, "std_normalize_sdpo", False):
         eps = getattr(self_distillation_config, "std_normalize_eps", 1e-8)
+
+        # Compute per-sequence mean loss (mean over tokens per sequence)
+        token_counts = loss_mask.sum(dim=-1).clamp(min=1.0)  # (bs,)
+        seq_losses = (per_token_loss * loss_mask).sum(dim=-1) / token_counts  # (bs,)
+
+        # Log pre-normalization mean
         valid_losses = per_token_loss[loss_mask.bool()]
-        if valid_losses.numel() > 1:
-            loss_std = valid_losses.std().detach()
-        else:
-            loss_std = torch.tensor(1.0, device=per_token_loss.device, dtype=per_token_loss.dtype)
-        # Log pre-normalization mean (use 0.0 when no valid tokens to keep metrics consistent across micro-batches)
         pre_norm_mean = valid_losses.mean().detach().item() if valid_losses.numel() > 0 else 0.0
         metrics["self_distillation/sdpo_loss_pre_norm"] = pre_norm_mean
-        per_token_loss = per_token_loss / (loss_std + eps)
-        # Log post-normalization mean and std used
-        post_norm_mean = per_token_loss[loss_mask.bool()].mean().detach().item() if valid_losses.numel() > 0 else 0.0
+
+        with torch.no_grad():
+            bsz = seq_losses.shape[0]
+
+            # Global std across all sequence-level losses in the batch
+            global_std = seq_losses.std().detach() if bsz > 1 else torch.tensor(1.0, device=per_token_loss.device, dtype=per_token_loss.dtype)
+
+            if index is not None:
+                # Per-group means (center within each uid group)
+                id2losses = defaultdict(list)
+                for i in range(bsz):
+                    id2losses[index[i]].append(seq_losses[i])
+                group_means = torch.zeros(bsz, device=per_token_loss.device, dtype=per_token_loss.dtype)
+                for i in range(bsz):
+                    group = id2losses[index[i]]
+                    if len(group) == 1:
+                        group_means[i] = 0.0
+                    else:
+                        group_means[i] = torch.mean(torch.stack(group)).detach()
+            else:
+                # Fallback: subtract global mean if no group index available
+                # print("[SDPO normalize] WARNING: no group index (uid) available, falling back to global mean centering")
+                # group_means = seq_losses.mean().detach().expand(bsz)
+                group_means = valid_losses.mean().detach().expand(bsz)  # flat token mean, broadcast
+
+        # Subtract per-group (sequence-level) mean from each token, divide by global std
+        per_token_loss = (per_token_loss - group_means.unsqueeze(-1)) / (global_std + eps)
+
+        # Log post-normalization mean, absolute mean, and std used
+        post_valid = per_token_loss[loss_mask.bool()]
+        post_norm_mean = post_valid.mean().detach().item() if post_valid.numel() > 0 else 0.0
+        post_norm_abs_mean = post_valid.abs().mean().detach().item() if post_valid.numel() > 0 else 0.0
         metrics["self_distillation/sdpo_loss_post_norm"] = post_norm_mean
-        metrics["self_distillation/loss_std"] = loss_std.item()
+        metrics["self_distillation/sdpo_loss_post_norm_abs"] = post_norm_abs_mean
+        metrics["self_distillation/loss_std"] = global_std.item()
 
     loss = agg_loss(
         loss_mat=per_token_loss,

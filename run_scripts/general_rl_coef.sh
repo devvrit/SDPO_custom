@@ -86,8 +86,7 @@ custom_reward_function.path=$CUSTOM_REWARD_PATH \
 actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 algorithm.adv_estimator=grpo_hybrid \
 actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
-actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=true \
-actor_rollout_ref.rollout.enforce_eager=true"
+actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=true"
 
 echo "----------------------------------------------------------------"
 echo "Starting Local SDPO + RL Training"
