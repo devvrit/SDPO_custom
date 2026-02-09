@@ -207,6 +207,15 @@ trainer:
   # Device to run training on (e.g., "cuda", "cpu")
   device: cuda
 
+  # Log raw traces (prompt + response with special tokens) to wandb every N steps; 0 = disabled
+  log_trace_interval: 0
+
+  # Number of unique prompts to sample for trace logging
+  log_trace_prompts: 3
+
+  # Number of response traces per prompt
+  log_trace_per_prompt: 2
+
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto

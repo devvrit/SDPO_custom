@@ -568,6 +568,115 @@ class RayPPOTrainer:
             print(f"OUTPUT:\n{out}")
         print("=" * 80)
 
+    def _maybe_log_traces(self, batch: DataProto, step: int):
+        """Log raw traces (prompt + response with all special tokens) to wandb as Tables."""
+        interval = self.config.trainer.get("log_trace_interval", 0)
+        if interval == 0 or step % interval != 0:
+            return
+
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+
+        n_prompts = self.config.trainer.get("log_trace_prompts", 3)
+        n_per_prompt = self.config.trainer.get("log_trace_per_prompt", 2)
+
+        # Group sample indices by UID
+        uids = batch.non_tensor_batch.get("uid", None)
+        if uids is None:
+            return
+
+        uid_to_indices: dict[Any, list[int]] = defaultdict(list)
+        for i, uid in enumerate(uids):
+            uid_to_indices[uid].append(i)
+
+        # Pick n_prompts unique UIDs
+        unique_uids = list(uid_to_indices.keys())
+        rng = np.random.RandomState(step)
+        rng.shuffle(unique_uids)
+        selected_uids = unique_uids[:n_prompts]
+
+        # Collect selected indices: up to n_per_prompt per UID
+        selected_indices = []
+        for uid in selected_uids:
+            indices = uid_to_indices[uid][:n_per_prompt]
+            selected_indices.extend(indices)
+
+        if not selected_indices:
+            return
+
+        # Build student traces table
+        has_interrupted = "interrupted" in batch.non_tensor_batch
+        student_columns = ["step", "uid", "sample_idx", "acc", "prompt_raw", "response_raw"]
+        if has_interrupted:
+            student_columns.extend(["interrupted", "phase1_len", "phase2_len"])
+        student_table = wandb.Table(columns=student_columns)
+
+        prompts = batch.batch["prompts"]
+        responses = batch.batch["responses"]
+        attention_mask = batch.batch["attention_mask"]
+        prompt_len = prompts.shape[1]
+
+        # acc from non_tensor_batch if available, else from token_level_scores
+        has_acc = "acc" in batch.non_tensor_batch
+
+        for i in selected_indices:
+            # Decode prompt: use attention_mask for prompt portion to skip padding
+            prompt_mask = attention_mask[i, :prompt_len]
+            prompt_ids = prompts[i][prompt_mask.bool()]
+            prompt_raw = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+
+            # Decode response: use attention_mask (not response_mask) to include all real tokens
+            # response_mask may zero-out interruption tokens for loss, but we want the full raw trace
+            resp_attn_mask = attention_mask[i, prompt_len:]
+            resp_ids = responses[i][resp_attn_mask.bool()]
+            response_raw = self.tokenizer.decode(resp_ids, skip_special_tokens=False)
+
+            # Get accuracy
+            if has_acc:
+                acc = float(batch.non_tensor_batch["acc"][i])
+            else:
+                acc = float(batch.batch["token_level_scores"][i].sum().item())
+
+            row = [step, str(uids[i]), i, acc, prompt_raw, response_raw]
+            if has_interrupted:
+                row.append(bool(batch.non_tensor_batch["interrupted"][i]))
+                row.append(int(batch.non_tensor_batch.get("phase1_length", np.zeros(len(uids)))[i]))
+                row.append(int(batch.non_tensor_batch.get("phase2_length", np.zeros(len(uids)))[i]))
+
+            student_table.add_data(*row)
+
+        wandb.log({"debug/student_traces": student_table}, step=step)
+
+        # If self-distillation is active, log teacher traces
+        if "teacher_input_ids" in batch.batch:
+            teacher_table = wandb.Table(columns=["step", "uid", "sample_idx", "acc", "teacher_full_raw"])
+            teacher_input_ids = batch.batch["teacher_input_ids"]
+            teacher_attention_mask = batch.batch["teacher_attention_mask"]
+            # teacher_attention_mask uses response_mask for the response portion,
+            # which may exclude interruption tokens. Rebuild with full response attention mask.
+            resp_len = responses.shape[1]
+            teacher_prompt_len = teacher_input_ids.shape[1] - resp_len
+
+            for i in selected_indices:
+                t_prompt_mask = teacher_attention_mask[i, :teacher_prompt_len]
+                t_resp_mask = attention_mask[i, prompt_len:]  # full response incl. interruption
+                t_full_mask = torch.cat([t_prompt_mask, t_resp_mask], dim=0)
+                t_ids = teacher_input_ids[i][t_full_mask.bool()]
+                teacher_raw = self.tokenizer.decode(t_ids, skip_special_tokens=False)
+
+                if has_acc:
+                    acc = float(batch.non_tensor_batch["acc"][i])
+                else:
+                    acc = float(batch.batch["token_level_scores"][i].sum().item())
+
+                teacher_table.add_data(step, str(uids[i]), i, acc, teacher_raw)
+
+            wandb.log({"debug/teacher_traces": teacher_table}, step=step)
+
     def _compute_or_extract_reward(
         self,
         batch: DataProto,
@@ -1955,6 +2064,9 @@ class RayPPOTrainer:
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
+
+                # Log raw traces to wandb for debugging (if configured)
+                self._maybe_log_traces(batch=batch, step=self.global_steps)
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

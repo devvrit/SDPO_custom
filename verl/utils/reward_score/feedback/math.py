@@ -148,7 +148,7 @@ def compute_score(
     extra_info = None,
     pause_tokens_index: Optional[list[int]] = None,
     format_feedback: bool = True,
-    correctness_feedback: bool = False,
+    correctness_feedback: bool = True,
 ) -> float:
     """Compute the reward score for a solution.
 

@@ -16,6 +16,7 @@
 #   ./submit.sh -p mi2508x -c general -s exp3 -n 2                        # multi-node (2 nodes)
 #   ./submit.sh -p mi2508x -c general -s exp3 -e "OLD-EXP-NAME"           # resume old run
 #   ./submit.sh -p mi3008x -c general -s exp1 ray_kwargs.ray_init.num_cpus=64
+#   ./submit.sh -p mi2508x -c general -s exp3 trainer.log_trace_interval=5 actor_rollout_ref.rollout.interruption.enable=true
 #
 # Flags:
 #   -p  SLURM partition (e.g., mi2508x, mi3258x)
@@ -29,6 +30,9 @@
 #
 # Partition-specific behavior:
 #   mi2508x: Enables FSDP optimizer and param offloading automatically
+#
+# Data-specific behavior:
+#   polaris*: Enables optimizer offload and sets model_dtype to bfloat16 (actor + ref)
 #
 # Run scripts live in run_scripts/ and should NOT include offloading args.
 # =============================================================================
@@ -120,16 +124,25 @@ if [ "$PARTITION" = "mi3008x" ]; then
     PARTITION_ARGS="ray_kwargs.ray_init.num_cpus=64"
 fi
 
+# Build data-specific Hydra args
+DATA_ARGS=""
+if [[ "$DATA" == *polaris* ]]; then
+    DATA_ARGS="actor_rollout_ref.actor.fsdp_config.optimizer_offload=true actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16"
+fi
+
 # Build multi-node Hydra args
 MULTINODE_ARGS=""
 if [ "$NNODES" -ge 2 ]; then
     MULTINODE_ARGS="trainer.nnodes=$NNODES +ray_kwargs.ray_init.address=auto actor_rollout_ref.actor.fsdp_config.fsdp_size=8"
 fi
 
-# Combine all extra Hydra args: partition + multinode + user
+# Combine all extra Hydra args: partition + data + multinode + user
 EXTRA_HYDRA_ARGS=""
 if [ -n "$PARTITION_ARGS" ]; then
     EXTRA_HYDRA_ARGS="$PARTITION_ARGS"
+fi
+if [ -n "$DATA_ARGS" ]; then
+    EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:+$EXTRA_HYDRA_ARGS }$DATA_ARGS"
 fi
 if [ -n "$MULTINODE_ARGS" ]; then
     EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:+$EXTRA_HYDRA_ARGS }$MULTINODE_ARGS"
@@ -172,6 +185,9 @@ echo "Suffix:     $SUFFIX"
 echo "Model:      $MODEL"
 echo "Data:       $DATA"
 echo "Run script: $RUN_SCRIPT"
+if [ -n "$DATA_ARGS" ]; then
+    echo "Polaris opts: optimizer_offload=true, model_dtype=bfloat16"
+fi
 if [ -n "$PARTITION_ARGS" ]; then
     echo "Offloading: enabled (mi2508x)"
 else

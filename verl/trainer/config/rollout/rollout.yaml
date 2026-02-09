@@ -331,6 +331,30 @@ prometheus:
   # Specify served_model_name to avoid displaying overly long model paths in Grafana
   served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
 
+# Two-phase interruption generation config
+interruption:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.InterruptionConfig
+
+  # whether to enable two-phase interruption generation
+  enable: false
+
+  # T1: max tokens for phase 1 (thinking)
+  max_thinking_tokens: 6144
+
+  # T2: max tokens for phase 2 (answer)
+  max_answer_tokens: 2048
+
+  # text injected when model doesn't produce </think> by T1
+  interruption_text: "\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.</think>\n"
+
+  # token that signals end of thinking phase
+  think_end_token: "</think>"
+
+  # if true, set response_mask=0 for interruption tokens (no loss on them)
+  mask_interruption_loss: true
+
 # type of quantization in vllm, currently support fp8 and torchao
 quantization: null
 

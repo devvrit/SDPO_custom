@@ -223,6 +223,23 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # Interruption metrics
+    if "interrupted" in batch.non_tensor_batch:
+        interrupted = batch.non_tensor_batch["interrupted"].astype(float)
+        metrics["interruption/fraction_interrupted"] = float(np.mean(interrupted))
+
+    if "phase1_length" in batch.non_tensor_batch:
+        p1_lengths = batch.non_tensor_batch["phase1_length"].astype(float)
+        metrics["interruption/phase1_length/mean"] = float(np.mean(p1_lengths))
+
+    if "phase2_length" in batch.non_tensor_batch:
+        p2_lengths = batch.non_tensor_batch["phase2_length"].astype(float)
+        metrics["interruption/phase2_length/mean"] = float(np.mean(p2_lengths))
+
+    if "phase2_truncated" in batch.non_tensor_batch:
+        p2_trunc = batch.non_tensor_batch["phase2_truncated"].astype(float)
+        metrics["interruption/phase2_truncation_fraction"] = float(np.mean(p2_trunc))
+
     return metrics
 
 

@@ -29,6 +29,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "InterruptionConfig",
     "RolloutConfig",
 ]
 
@@ -118,6 +119,21 @@ class PrometheusConfig(BaseConfig):
 
 
 @dataclass
+class InterruptionConfig(BaseConfig):
+    """Config for two-phase interruption generation."""
+
+    enable: bool = False
+    max_thinking_tokens: int = 6144  # T1: max tokens for phase 1
+    max_answer_tokens: int = 2048  # T2: max tokens for phase 2
+    interruption_text: str = (
+        "\nConsidering the limited time by the user,"
+        " I have to give the solution based on the thinking directly now.</think>\n"
+    )
+    think_end_token: str = "</think>"
+    mask_interruption_loss: bool = True  # if True, set response_mask=0 for interruption tokens
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -184,6 +200,9 @@ class RolloutConfig(BaseConfig):
 
     # Use Prometheus to collect and monitor rollout statistics
     prometheus: PrometheusConfig = field(default_factory=PrometheusConfig)
+
+    # Two-phase interruption generation config
+    interruption: InterruptionConfig = field(default_factory=InterruptionConfig)
 
     # Extension point for custom configurations
     custom: Optional[dict] = None
