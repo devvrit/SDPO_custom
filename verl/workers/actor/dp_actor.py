@@ -382,7 +382,19 @@ class DataParallelPPOActor(BasePPOActor):
                                     topk_indices_rmpad.unsqueeze(0), dim=1, padding=True
                                 ).squeeze(0)
                             topk_logits_rmpad = torch.gather(logits_rmpad, dim=-1, index=topk_indices_rmpad)
-                        logsumexp_rmpad = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)
+                        # Chunk logsumexp to avoid materializing a full fp32 intermediate
+                        # (total_nnz × vocab_size × 4 bytes can OOM on smaller GPUs).
+                        _LSE_CHUNK = 4096
+                        if logits_rmpad.shape[0] > _LSE_CHUNK:
+                            logsumexp_rmpad = torch.cat(
+                                [
+                                    torch.logsumexp(logits_rmpad[i : i + _LSE_CHUNK], dim=-1, keepdim=True)
+                                    for i in range(0, logits_rmpad.shape[0], _LSE_CHUNK)
+                                ],
+                                dim=0,
+                            )
+                        else:
+                            logsumexp_rmpad = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)
                         topk_logps_rmpad = topk_logits_rmpad - logsumexp_rmpad
 
                     # Compute sum_pi_squared if requested (for optimal_token_baseline)
@@ -819,6 +831,12 @@ class DataParallelPPOActor(BasePPOActor):
                             self.teacher_module is None or self.teacher_module is self.actor_module
                         ):
                             raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+
+                        teacher_rl_loss_coef = getattr(self_distillation_cfg, "teacher_rl_loss_coef", 0.0)
+
+                        # Teacher forward with no_grad for SDPO (cheap, no activation storage).
+                        # When teacher_rl_loss_coef > 0, a second forward WITH grad happens
+                        # later in a separate backward pass to avoid holding both graphs at once.
                         with torch.no_grad():
                             teacher_outputs = self._forward_micro_batch(
                                 teacher_inputs,
@@ -827,7 +845,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 return_all_logps=return_all_logps,
                                 distill_topk=distill_topk,
                                 topk_indices=student_topk_indices,
-                                module=teacher_model,
+                                module=self.actor_module if teacher_rl_loss_coef > 0.0 else teacher_model,
                             )
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
@@ -872,6 +890,14 @@ class DataParallelPPOActor(BasePPOActor):
                             pg_loss = sdpo_loss + rl_loss_coef * rl_loss
                         else:
                             pg_loss = sdpo_loss
+
+                        # Save detached values for teacher RL (needed after main backward)
+                        if teacher_rl_loss_coef > 0.0:
+                            _teacher_rl_student_log_prob = log_prob.detach().clone()
+                            _teacher_rl_old_log_prob = old_log_prob.detach().clone()
+                            _teacher_rl_advantages = advantages.detach().clone()
+                            _teacher_rl_response_mask = response_mask
+                            _teacher_rl_sd_mask = self_distillation_mask
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
@@ -931,6 +957,52 @@ class DataParallelPPOActor(BasePPOActor):
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+
+                    # Phase 2: Teacher-context RL loss in a separate forward+backward.
+                    # The main backward above freed the student graph, so peak memory
+                    # is the same as a single forward pass — no extra memory cost.
+                    if self_distillation_enabled and teacher_rl_loss_coef > 0.0:
+                        teacher_rl_outputs = self._forward_micro_batch(
+                            teacher_inputs,
+                            temperature=temperature,
+                            calculate_entropy=False,
+                            module=self.actor_module,
+                        )
+                        teacher_log_prob_with_grad = teacher_rl_outputs["log_probs"]
+
+                        # IS weight: stopgrad(π_student / π_teacher)
+                        is_weight = torch.exp(_teacher_rl_student_log_prob - teacher_log_prob_with_grad.detach())
+                        teacher_rl_is_clip = getattr(self_distillation_cfg, "teacher_rl_is_clip", 5.0)
+                        is_weight = is_weight.clamp(max=teacher_rl_is_clip)
+
+                        # Use full response_mask (all samples, including groups
+                        # where no rollout succeeded). This keeps the denominator
+                        # in agg_loss always > 0 and trains the teacher on every sample.
+                        teacher_rl_mask = _teacher_rl_response_mask
+
+                        # GRPO (PPO-style) loss for teacher context
+                        teacher_rl_loss_fn = get_policy_loss_fn("vanilla")
+                        teacher_rl_loss, teacher_rl_metrics = teacher_rl_loss_fn(
+                            old_log_prob=_teacher_rl_old_log_prob,
+                            log_prob=teacher_log_prob_with_grad,
+                            advantages=_teacher_rl_advantages,
+                            response_mask=teacher_rl_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=is_weight,
+                        )
+
+                        teacher_rl_scaled = teacher_rl_loss_coef * teacher_rl_loss * loss_scale_factor
+                        if self.scaler is not None:
+                            self.scaler.scale(teacher_rl_scaled).backward()
+                        else:
+                            teacher_rl_scaled.backward()
+
+                        for k, v in teacher_rl_metrics.items():
+                            micro_batch_metrics[f"teacher_rl/{k.split('/')[-1]}"] = v
+                        micro_batch_metrics["actor/teacher_rl_loss"] = teacher_rl_loss.detach().item()
+                        micro_batch_metrics["actor/teacher_rl_loss_coef"] = teacher_rl_loss_coef
+                        micro_batch_metrics["teacher_rl/is_weight_mean"] = is_weight[teacher_rl_mask.bool()].mean().item()
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)

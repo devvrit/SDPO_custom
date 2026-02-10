@@ -770,6 +770,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # add empty cache after each compute
         aggressive_empty_cache(force_sync=True)
 
+        # Diagnostic: print current memory after rollout cleanup
+        device = get_torch_device()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            alloc_gb = device.memory_allocated() / (1024**3)
+            reserved_gb = device.memory_reserved() / (1024**3)
+            free_gpu, total_gpu = torch.cuda.mem_get_info()
+            free_gb = free_gpu / (1024**3)
+            total_gb = total_gpu / (1024**3)
+            print(f"[DIAG] After rollout cleanup: allocated={alloc_gb:.2f} GB, reserved={reserved_gb:.2f} GB, gpu_free={free_gb:.2f}/{total_gb:.2f} GB")
+
         set_expandable_segments(True)
 
         # restore random states
@@ -954,6 +965,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            # Diagnostic: current memory after training (not watermark)
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                alloc_gb = get_torch_device().memory_allocated() / (1024**3)
+                reserved_gb = get_torch_device().memory_reserved() / (1024**3)
+                free_gpu, total_gpu = torch.cuda.mem_get_info()
+                free_gb = free_gpu / (1024**3)
+                total_gb = total_gpu / (1024**3)
+                print(f"[DIAG] After update_actor: allocated={alloc_gb:.2f} GB, reserved={reserved_gb:.2f} GB, gpu_free={free_gb:.2f}/{total_gb:.2f} GB")
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr

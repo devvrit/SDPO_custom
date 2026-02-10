@@ -2068,6 +2068,25 @@ class RayPPOTrainer:
                 # Log raw traces to wandb for debugging (if configured)
                 self._maybe_log_traces(batch=batch, step=self.global_steps)
 
+                # Log one sample question/response per step
+                try:
+                    prompts = batch.batch["prompts"]
+                    responses = batch.batch["responses"]
+                    attn_mask = batch.batch["attention_mask"]
+                    prompt_len = prompts.shape[1]
+                    idx = 0
+                    p_mask = attn_mask[idx, :prompt_len]
+                    prompt_text = self.tokenizer.decode(prompts[idx][p_mask.bool()], skip_special_tokens=True)
+                    r_mask = attn_mask[idx, prompt_len:]
+                    response_text = self.tokenizer.decode(responses[idx][r_mask.bool()], skip_special_tokens=True)
+                    acc = float(batch.non_tensor_batch["acc"][idx]) if "acc" in batch.non_tensor_batch else "N/A"
+                    print(f"\n{'='*60}\nSTEP {self.global_steps} SAMPLE (acc={acc})\n{'='*60}")
+                    print(f"PROMPT:\n{prompt_text}")
+                    print(f"\nRESPONSE:\n{response_text}")
+                    print(f"{'='*60}\n")
+                except Exception as e:
+                    print(f"[step {self.global_steps}] Failed to log sample: {e}")
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 

@@ -91,6 +91,8 @@ class SelfDistillationConfig(BaseConfig):
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
     rl_loss_coef: float = 0.0
+    teacher_rl_loss_coef: float = 0.0  # Weight for teacher-context RL loss (0 = disabled)
+    teacher_rl_is_clip: float = 5.0  # Clip IS weight stopgrad(p_student/p_teacher) for stability
     std_normalize_sdpo: bool = False
     std_normalize_eps: float = 1e-8
 

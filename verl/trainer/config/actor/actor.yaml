@@ -130,6 +130,13 @@ self_distillation:
   # Weight for RL policy gradient loss combined with SDPO: L = L_sdpo + rl_loss_coef * L_RL
   rl_loss_coef: 0.0
 
+  # Weight for teacher-context RL loss (0 = disabled). Uses actor_module on
+  # reprompted teacher inputs with IS correction stopgrad(p_student/p_teacher).
+  teacher_rl_loss_coef: 0.0
+
+  # Clip IS weight for teacher RL loss stability
+  teacher_rl_is_clip: 5.0
+
   # Whether to normalize per-token SDPO losses by std before aggregation
   std_normalize_sdpo: false
 

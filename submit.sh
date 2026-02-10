@@ -32,7 +32,7 @@
 #   mi2508x: Enables FSDP optimizer and param offloading automatically
 #
 # Data-specific behavior:
-#   polaris*: Enables optimizer offload and sets model_dtype to bfloat16 (actor + ref)
+#   polaris*: Sets model_dtype to bfloat16 (actor + ref)
 #
 # Run scripts live in run_scripts/ and should NOT include offloading args.
 # =============================================================================
@@ -127,7 +127,9 @@ fi
 # Build data-specific Hydra args
 DATA_ARGS=""
 if [[ "$DATA" == *polaris* ]]; then
-    DATA_ARGS="actor_rollout_ref.actor.fsdp_config.optimizer_offload=true actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16"
+    DATA_ARGS="actor_rollout_ref.rollout.gpu_memory_utilization=0.3"
+elif [ "$CONFIG" = "cotrain" ]; then
+    DATA_ARGS="actor_rollout_ref.rollout.gpu_memory_utilization=0.4"
 fi
 
 # Build multi-node Hydra args
@@ -186,7 +188,7 @@ echo "Model:      $MODEL"
 echo "Data:       $DATA"
 echo "Run script: $RUN_SCRIPT"
 if [ -n "$DATA_ARGS" ]; then
-    echo "Polaris opts: optimizer_offload=true, model_dtype=bfloat16"
+    echo "Polaris opts: model_dtype=bfloat16"
 fi
 if [ -n "$PARTITION_ARGS" ]; then
     echo "Offloading: enabled (mi2508x)"
