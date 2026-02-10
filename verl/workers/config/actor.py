@@ -377,6 +377,7 @@ class FSDPActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
     calculate_sum_pi_squared: bool = False
     sum_pi_squared_checkpointing: bool = False
+    lse_chunk_size: int = -1
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

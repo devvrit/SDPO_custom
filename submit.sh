@@ -17,6 +17,9 @@
 #   ./submit.sh -p mi2508x -c general -s exp3 -e "OLD-EXP-NAME"           # resume old run
 #   ./submit.sh -p mi3008x -c general -s exp1 ray_kwargs.ray_init.num_cpus=64
 #   ./submit.sh -p mi2508x -c general -s exp3 trainer.log_trace_interval=5 actor_rollout_ref.rollout.interruption.enable=true
+#   ./submit.sh -p mi2508x -c general -s exp3 data.apply_chat_template_kwargs.enable_thinking=true
+#   actor_rollout_ref.actor.self_distillation.remove_thinking_from_demonstration=true
+#   actor_rollout_ref.actor.lse_chunk_size=4096
 #
 # Flags:
 #   -p  SLURM partition (e.g., mi2508x, mi3258x)

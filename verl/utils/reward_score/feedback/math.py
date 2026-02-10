@@ -98,13 +98,6 @@ def is_correct_strict_box(
     Returns:
         Tuple of (score, extracted_prediction)
     """
-    # Extract the relevant part of the prediction
-    if pause_tokens_index is not None:
-        assert len(pause_tokens_index) == 4
-        pred = pred[pause_tokens_index[-1] - 100 :]
-    else:
-        pred = pred[-100:]
-
     # Extract and check the boxed answer
     boxed_pred = last_boxed_only_string(pred)
     extracted_pred = remove_boxed(boxed_pred) if boxed_pred is not None else None
