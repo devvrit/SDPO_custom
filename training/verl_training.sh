@@ -11,7 +11,7 @@ export WANDB_ENTITY="tinker-sft" # team
 export EXPERIMENT=${1:-"experiment"}
 CONFIG_NAME=${2:-"ppo_trainer"}
 export TASK=${3:-"datasets/ttcs/lasgroup_verifiable-corpus_math-ai_math500_1000"}
-export SSL_CERT_FILE=/work1/agrawal/devvrit/SDPO_custom/cacert.pem
+export SSL_CERT_FILE=${PROJECT_ROOT}/cacert.pem
 
 # removes the first three arguments from the command line
 if [ "$#" -ge 3 ]; then

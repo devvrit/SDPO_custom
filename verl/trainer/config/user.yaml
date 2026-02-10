@@ -2,10 +2,10 @@ defaults:
   - _self_
 
 vars:
-  dir: /work1/agrawal/devvrit/SDPO_custom
+  dir: ${oc.env:PROJECT_ROOT}
   task: ${oc.env:TASK}
-  log_dir: /work1/agrawal/devvrit/SDPO_custom/output
-  ckpt_dir: /work1/agrawal/devvrit/SDPO_custom/ttrl_runs/${vars.task}
+  log_dir: ${oc.env:PROJECT_ROOT}/output
+  ckpt_dir: ${oc.env:PROJECT_ROOT}/ttrl_runs/${vars.task}
 
 data:
   train_files: ["${vars.dir}/${vars.task}/train.parquet"]
@@ -44,7 +44,7 @@ algorithm:
   use_kl_in_reward: False
 
 custom_reward_function:
-  path: /work1/agrawal/devvrit/SDPO_custom/verl/utils/reward_score/feedback/__init__.py
+  path: ${oc.env:PROJECT_ROOT}/verl/utils/reward_score/feedback/__init__.py
 
 critic:
   model:
