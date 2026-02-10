@@ -384,12 +384,12 @@ class DataParallelPPOActor(BasePPOActor):
                             topk_logits_rmpad = torch.gather(logits_rmpad, dim=-1, index=topk_indices_rmpad)
                         # Chunk logsumexp to avoid materializing a full fp32 intermediate
                         # (total_nnz × vocab_size × 4 bytes can OOM on smaller GPUs).
-                        _LSE_CHUNK = 4096
-                        if logits_rmpad.shape[0] > _LSE_CHUNK:
+                        _lse_chunk = self.config.get("lse_chunk_size", -1)
+                        if _lse_chunk > 0 and logits_rmpad.shape[0] > _lse_chunk:
                             logsumexp_rmpad = torch.cat(
                                 [
-                                    torch.logsumexp(logits_rmpad[i : i + _LSE_CHUNK], dim=-1, keepdim=True)
-                                    for i in range(0, logits_rmpad.shape[0], _LSE_CHUNK)
+                                    torch.logsumexp(logits_rmpad[i : i + _lse_chunk], dim=-1, keepdim=True)
+                                    for i in range(0, logits_rmpad.shape[0], _lse_chunk)
                                 ],
                                 dim=0,
                             )

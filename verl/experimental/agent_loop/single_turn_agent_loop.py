@@ -65,6 +65,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
 
         if self.interruption_enabled:
+            # When enable_thinking=true, the chat template ends with <|im_start|>assistant\n
+            # but does NOT include <think>. Append it so the model starts in thinking mode,
+            # matching the approach in eval_vllm.py.
+            enable_thinking = self.apply_chat_template_kwargs.get("enable_thinking", None)
+            if enable_thinking is True:
+                think_start_ids = self.tokenizer.encode("<think>", add_special_tokens=False)
+                prompt_ids = prompt_ids + think_start_ids
             return await self._run_two_phase(prompt_ids, sampling_params, images, videos, multi_modal_data)
 
         # 3. generate sequences (original single-call path)

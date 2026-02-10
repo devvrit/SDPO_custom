@@ -571,7 +571,7 @@ class RayPPOTrainer:
     def _maybe_log_traces(self, batch: DataProto, step: int):
         """Log raw traces (prompt + response with all special tokens) to wandb as Tables."""
         interval = self.config.trainer.get("log_trace_interval", 0)
-        if interval == 0 or step % interval != 0:
+        if interval == 0 or (step % interval != 0 and step != 1):
             return
 
         try:
@@ -895,8 +895,24 @@ class RayPPOTrainer:
             padding=True,
             truncation=True,
         )
-        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
-        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
+        teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
+        teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
+
+        # When thinking is enabled, the student prompt has <think> appended after
+        # apply_chat_template (in single_turn_agent_loop). Do the same for the teacher
+        # so the response tokens are contextualised identically.
+        # But skip this if thinking was stripped from the demonstration, since the
+        # response no longer starts with thinking content.
+        remove_thinking = self_distillation_cfg.get("remove_thinking_from_demonstration", False)
+        if enable_thinking and not remove_thinking:
+            think_token_ids = self.tokenizer.encode("<think>", add_special_tokens=False)
+            think_ids = torch.tensor([think_token_ids] * teacher_prompt_ids.shape[0], device=device)
+            think_mask = torch.ones_like(think_ids)
+            teacher_prompt_ids = torch.cat([teacher_prompt_ids, think_ids], dim=1)
+            teacher_prompt_mask = torch.cat([teacher_prompt_mask, think_mask], dim=1)
+
+        teacher_input_ids = torch.cat([teacher_prompt_ids, responses], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt_mask, response_mask], dim=1)
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
         # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
