@@ -23,8 +23,15 @@ ALPHA=0.5
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
 export N_GPUS_PER_NODE=8
 
+# =============================================================================
+# SETUP
+# =============================================================================
+
+export PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+export PYTHONPATH=$PROJECT_ROOT:${WORK:+$WORK/python_packages:}$PYTHONPATH
+
 # Directory configuration
-BASE_DIR="/work1/agrawal/devvrit/SDPO_custom"
+BASE_DIR="${PROJECT_ROOT}"
 LOG_DIR="${BASE_DIR}/output"
 CKPT_DIR="${BASE_DIR}/ttrl_runs"
 CUSTOM_REWARD_PATH="${BASE_DIR}/verl/utils/reward_score/feedback/__init__.py"
@@ -34,13 +41,6 @@ GPU_MEMORY_UTILIZATION=0.45
 
 # Allow overriding experiment name suffix
 SUFFIX=${1:-"sdpo_rl"}
-
-# =============================================================================
-# SETUP
-# =============================================================================
-
-export PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
-export PYTHONPATH=$WORK/python_packages:$PROJECT_ROOT:$PYTHONPATH
 
 export USER=${USER:-$(whoami)}
 

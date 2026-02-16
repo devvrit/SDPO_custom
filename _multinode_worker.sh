@@ -13,6 +13,23 @@
 
 set -e
 
+# Determine execution prefix (container on AMD, direct on AWS)
+if [ "${CLUSTER_USE_CONTAINER}" = true ]; then
+    EXEC_PREFIX="./container_exec.sh"
+else
+    EXEC_PREFIX=""
+fi
+
+# Activate conda env if specified (AWS cluster)
+if [ -n "${CLUSTER_CONDA_ENV}" ]; then
+    eval "$(conda shell.bash hook)"
+    conda activate "${CLUSTER_CONDA_ENV}"
+    echo "Activated conda env: ${CLUSTER_CONDA_ENV}"
+    # Clear AMD/ROCm env vars that conflict with NVIDIA/CUDA
+    unset ROCR_VISIBLE_DEVICES 2>/dev/null || true
+    unset HIP_VISIBLE_DEVICES 2>/dev/null || true
+fi
+
 echo "============================================"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node list: $SLURM_JOB_NODELIST"
@@ -26,7 +43,9 @@ cd "$SCRIPT_DIR"
 
 # SSL certs for wandb — must be set before Ray daemons start so all
 # Ray-spawned actors inherit it.
-export SSL_CERT_FILE=/work1/agrawal/devvrit/SDPO_custom/cacert.pem
+if [ -f "${SCRIPT_DIR}/cacert.pem" ]; then
+    export SSL_CERT_FILE="${SCRIPT_DIR}/cacert.pem"
+fi
 
 # =============================================================================
 # 1. DETECT HEAD NODE IP
@@ -115,7 +134,7 @@ echo "============================================"
 # Start Ray HEAD on head node (backgrounded — runs as daemon with --block)
 echo "Starting Ray HEAD on $head_node"
 srun --nodes=1 --ntasks=1 -w "$head_node" \
-    ./container_exec.sh \
+    $EXEC_PREFIX \
         ray start --head --node-ip-address="$head_node_ip" --port=$port \
             --dashboard-port=8266 \
             --num-cpus "$CPUS_PER_TASK" --num-gpus "$GPUS_PER_NODE" --block &
@@ -135,7 +154,7 @@ for ((i = 1; i <= worker_num; i++)); do
     fi
     echo "Starting Ray WORKER $i on $node_i"
     srun --nodes=1 --ntasks=1 -w "$node_i" \
-        ./container_exec.sh \
+        $EXEC_PREFIX \
             ray start --address "$ip_head" \
                 --num-cpus "$CPUS_PER_TASK" --num-gpus "$GPUS_PER_NODE" --block &
     sleep 5
@@ -151,7 +170,7 @@ sleep 10
 
 echo "Validating Ray cluster..."
 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
-    ./container_exec.sh \
+    $EXEC_PREFIX \
         python3 -c "
 import ray
 try:
@@ -206,11 +225,11 @@ if [ "$REQUEUE" = true ]; then
 
     # Run in background so the trap can fire while we wait
     srun --overlap --nodes=$SLURM_NNODES --ntasks=1 -w "$head_node" \
-        ./container_exec.sh bash -c "$TRAIN_CMD" &
+        $EXEC_PREFIX bash -c "$TRAIN_CMD" &
     wait $!
 else
     srun --overlap --nodes=$SLURM_NNODES --ntasks=1 -w "$head_node" \
-        ./container_exec.sh bash -c "$TRAIN_CMD"
+        $EXEC_PREFIX bash -c "$TRAIN_CMD"
 fi
 
 echo "============================================"

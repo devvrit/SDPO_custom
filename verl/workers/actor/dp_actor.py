@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import time
 from types import SimpleNamespace
 from typing import Optional
 
@@ -751,6 +752,9 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/kl_loss": 0.0,
         }
         did_update = False
+        _time_student_fwd = 0.0
+        _time_teacher_fwd = 0.0
+        _time_backward = 0.0
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -791,6 +795,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
+                    _t0 = time.monotonic()
                     outputs = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
@@ -798,6 +803,7 @@ class DataParallelPPOActor(BasePPOActor):
                         return_all_logps=return_all_logps,
                         distill_topk=distill_topk,
                     )
+                    _time_student_fwd += time.monotonic() - _t0
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
                     student_all_logps = outputs.get("all_logps") if return_all_logps else None
@@ -836,7 +842,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                         # Teacher forward with no_grad for SDPO (cheap, no activation storage).
                         # When teacher_rl_loss_coef > 0, a second forward WITH grad happens
-                        # later in a separate backward pass to avoid holding both graphs at once.
+        a                # later in a separate backward pass to avoid holding both graphs at once.
+                        _t0 = time.monotonic()
                         with torch.no_grad():
                             teacher_outputs = self._forward_micro_batch(
                                 teacher_inputs,
@@ -845,8 +852,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 return_all_logps=return_all_logps,
                                 distill_topk=distill_topk,
                                 topk_indices=student_topk_indices,
-                                module=self.actor_module if teacher_rl_loss_coef > 0.0 else teacher_model,
+                                module=teacher_model,
                             )
+                        _time_teacher_fwd += time.monotonic() - _t0
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
@@ -864,6 +872,7 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
                             index=model_inputs.get("uid"),
+                            advantages=advantages,
                         )
 
                         sdpo_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
@@ -893,10 +902,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                         # Save detached values for teacher RL (needed after main backward)
                         if teacher_rl_loss_coef > 0.0:
-                            _teacher_rl_student_log_prob = log_prob.detach().clone()
                             _teacher_rl_old_log_prob = old_log_prob.detach().clone()
                             _teacher_rl_advantages = advantages.detach().clone()
-                            _teacher_rl_response_mask = response_mask
                             _teacher_rl_sd_mask = self_distillation_mask
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
@@ -953,14 +960,16 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    _t0 = time.monotonic()
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    _time_backward += time.monotonic() - _t0
 
-                    # Phase 2: Teacher-context RL loss in a separate forward+backward.
+                    # Teacher-context RL loss in a separate forward+backward.
                     # The main backward above freed the student graph, so peak memory
-                    # is the same as a single forward pass — no extra memory cost.
+                    # is the same as a single forward pass.
                     if self_distillation_enabled and teacher_rl_loss_coef > 0.0:
                         teacher_rl_outputs = self._forward_micro_batch(
                             teacher_inputs,
@@ -970,26 +979,19 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         teacher_log_prob_with_grad = teacher_rl_outputs["log_probs"]
 
-                        # IS weight: stopgrad(π_student / π_teacher)
-                        is_weight = torch.exp(_teacher_rl_student_log_prob - teacher_log_prob_with_grad.detach())
-                        teacher_rl_is_clip = getattr(self_distillation_cfg, "teacher_rl_is_clip", 5.0)
-                        is_weight = is_weight.clamp(max=teacher_rl_is_clip)
-
-                        # Use full response_mask (all samples, including groups
-                        # where no rollout succeeded). This keeps the denominator
-                        # in agg_loss always > 0 and trains the teacher on every sample.
-                        teacher_rl_mask = _teacher_rl_response_mask
-
-                        # GRPO (PPO-style) loss for teacher context
+                        # Off-policy RL on teacher context with student rollout traces.
+                        # The vanilla loss computes ratio = π_teacher_ctx / π_old (with grad).
+                        # Multiplied by rollout_is_weights = π_old / π_rollout (from batch),
+                        # this gives the correct IS weight: π_teacher_ctx / π_rollout.
                         teacher_rl_loss_fn = get_policy_loss_fn("vanilla")
                         teacher_rl_loss, teacher_rl_metrics = teacher_rl_loss_fn(
                             old_log_prob=_teacher_rl_old_log_prob,
                             log_prob=teacher_log_prob_with_grad,
                             advantages=_teacher_rl_advantages,
-                            response_mask=teacher_rl_mask,
+                            response_mask=response_mask,
                             loss_agg_mode=loss_agg_mode,
                             config=self.config,
-                            rollout_is_weights=is_weight,
+                            rollout_is_weights=rollout_is_weights,
                         )
 
                         teacher_rl_scaled = teacher_rl_loss_coef * teacher_rl_loss * loss_scale_factor
@@ -1002,7 +1004,8 @@ class DataParallelPPOActor(BasePPOActor):
                             micro_batch_metrics[f"teacher_rl/{k.split('/')[-1]}"] = v
                         micro_batch_metrics["actor/teacher_rl_loss"] = teacher_rl_loss.detach().item()
                         micro_batch_metrics["actor/teacher_rl_loss_coef"] = teacher_rl_loss_coef
-                        micro_batch_metrics["teacher_rl/is_weight_mean"] = is_weight[teacher_rl_mask.bool()].mean().item()
+                        if rollout_is_weights is not None:
+                            micro_batch_metrics["teacher_rl/is_weight_mean"] = rollout_is_weights[response_mask.bool()].mean().item()
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
@@ -1015,4 +1018,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         if did_update:
             self._update_teacher()
+        metrics["perf/time_teacher_fwd"] = [_time_teacher_fwd]
+        metrics["perf/time_student_fwd"] = [_time_student_fwd]
+        metrics["perf/time_student_backward"] = [_time_backward]
         return metrics

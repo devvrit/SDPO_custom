@@ -240,6 +240,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         p2_trunc = batch.non_tensor_batch["phase2_truncated"].astype(float)
         metrics["interruption/phase2_truncation_fraction"] = float(np.mean(p2_trunc))
 
+        # Break down phase2 truncation by interrupted vs non-interrupted
+        if "interrupted" in batch.non_tensor_batch:
+            interrupted_mask = batch.non_tensor_batch["interrupted"].astype(bool)
+            if interrupted_mask.any():
+                metrics["interruption/phase2_truncation_fraction_interrupted"] = float(np.mean(p2_trunc[interrupted_mask]))
+            if (~interrupted_mask).any():
+                metrics["interruption/phase2_truncation_fraction_not_interrupted"] = float(np.mean(p2_trunc[~interrupted_mask]))
+
     return metrics
 
 

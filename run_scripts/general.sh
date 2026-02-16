@@ -19,12 +19,19 @@ LR=1e-5
 LAMBDA=0.0
 CLIP_ADV_HIGH=null
 DONTS_REPROMPT_ON_SELF_SUCCESS=True
-ALPHA=0.5 # KUSHA: this should be 0 for reverse KL, setting to 0.5 for now to match their numbers?
+ALPHA=1.0 # KUSHA: this should be 1 for reverse KL, setting to 0.5 to match their numbers?
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
 export N_GPUS_PER_NODE=8
 
+# =============================================================================
+# SETUP
+# =============================================================================
+
+export PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+export PYTHONPATH=$PROJECT_ROOT:${WORK:+$WORK/python_packages:}$PYTHONPATH
+
 # Directory configuration
-BASE_DIR="/work1/agrawal/devvrit/SDPO_custom"
+BASE_DIR="${PROJECT_ROOT}"
 LOG_DIR="${BASE_DIR}/output"
 CKPT_DIR="${BASE_DIR}/ttrl_runs"
 CUSTOM_REWARD_PATH="${BASE_DIR}/verl/utils/reward_score/feedback/__init__.py"
@@ -34,13 +41,6 @@ GPU_MEMORY_UTILIZATION=0.55
 
 # Allow overriding experiment name suffix
 SUFFIX=${1:-"local"}
-
-# =============================================================================
-# SETUP
-# =============================================================================
-
-export PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
-export PYTHONPATH=$WORK/python_packages:$PROJECT_ROOT:$PYTHONPATH
 
 export USER=${USER:-$(whoami)}
 

@@ -23,17 +23,24 @@ LR=1e-5
 LAMBDA=0.0
 CLIP_ADV_HIGH=null
 DONTS_REPROMPT_ON_SELF_SUCCESS=True
-ALPHA=0.5
+ALPHA=0.0
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
 export N_GPUS_PER_NODE=8
 
 # Teacher RL loss settings
-TEACHER_RL_LOSS_COEF=0.5
+TEACHER_RL_LOSS_COEF=0.1
 TEACHER_RL_IS_CLIP=5.0
-TEACHER_UPDATE_RATE=0.0  # disable EMA (teacher = student)
+TEACHER_UPDATE_RATE=0.05  # EMA teacher for stable SDPO target
+
+# =============================================================================
+# SETUP
+# =============================================================================
+
+export PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+export PYTHONPATH=$PROJECT_ROOT:${WORK:+$WORK/python_packages:}$PYTHONPATH
 
 # Directory configuration
-BASE_DIR="/work1/agrawal/devvrit/SDPO_custom"
+BASE_DIR="${PROJECT_ROOT}"
 LOG_DIR="${BASE_DIR}/output"
 CKPT_DIR="${BASE_DIR}/ttrl_runs"
 CUSTOM_REWARD_PATH="${BASE_DIR}/verl/utils/reward_score/feedback/__init__.py"
@@ -43,13 +50,6 @@ GPU_MEMORY_UTILIZATION=0.55
 
 # Allow overriding experiment name suffix
 SUFFIX=${1:-"local"}
-
-# =============================================================================
-# SETUP
-# =============================================================================
-
-export PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
-export PYTHONPATH=$WORK/python_packages:$PROJECT_ROOT:$PYTHONPATH
 
 export USER=${USER:-$(whoami)}
 

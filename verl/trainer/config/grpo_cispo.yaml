@@ -1,0 +1,35 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# MAX_PROMPT_LENGTH=2048
+# MAX_RESPONSE_LENGTH=8192
+# MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
+max_model_len: 10240
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: cispo
+    clip_ratio_low: 1.0   # lower clamp = 1 - 1.0 = 0
+    clip_ratio_high: 3.0  # upper clamp = 1 + 3.0 = 4
+    use_kl_loss: false
+  rollout:
+    n: 16
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  use_kl_in_reward: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 4.0  # truncate π_θ_old/π_generator to [0, 4]
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: True

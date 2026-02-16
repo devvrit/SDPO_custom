@@ -20,6 +20,8 @@
 #   ./submit.sh -p mi2508x -c general -s exp3 data.apply_chat_template_kwargs.enable_thinking=true
 #   actor_rollout_ref.actor.self_distillation.remove_thinking_from_demonstration=true
 #   actor_rollout_ref.actor.lse_chunk_size=4096
+#   actor_rollout_ref.actor.self_distillation.advantage_sign_masking=true
+#   actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.01
 #
 # Flags:
 #   -p  SLURM partition (e.g., mi2508x, mi3258x)
@@ -44,6 +46,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Auto-detect cluster type
+source "${SCRIPT_DIR}/cluster_env.sh"
+
 usage() {
     echo "Usage: ./submit.sh -p PARTITION -c CONFIG -s SUFFIX [-n NNODES] [-m MODEL] [-d DATA] [-e EXP_NAME] [-r] [extra hydra args...]"
     echo ""
@@ -57,6 +62,7 @@ usage() {
     echo "  -m  Model path (default: Qwen/Qwen3-8B)"
     echo "  -d  Data path (default: datasets/tooluse)"
     echo "  -e  Experiment name override (for resuming old runs with different naming)"
+    echo "  -t  Time limit in hours (default: 12)"
     echo "  -r  Auto-requeue on time limit (resubmits with same args)"
     echo ""
     echo "Available run scripts:"
@@ -65,16 +71,17 @@ usage() {
 }
 
 # Parse flags
-PARTITION="mi2508x"
+PARTITION="$CLUSTER_DEFAULT_PARTITION"
 CONFIG="general"
 SUFFIX="$(date +%d%m_%H%M)"
 NNODES=1
 MODEL="Qwen/Qwen3-8B"
 DATA="datasets/tooluse"
 EXP_NAME_OVERRIDE=""
+TIME_HOURS=12
 REQUEUE=false
 
-while getopts "p:c:s:n:m:d:e:r" opt; do
+while getopts "p:c:s:n:m:d:e:t:r" opt; do
     case $opt in
         p) PARTITION="$OPTARG" ;;
         c) CONFIG="$OPTARG" ;;
@@ -83,6 +90,7 @@ while getopts "p:c:s:n:m:d:e:r" opt; do
         m) MODEL="$OPTARG" ;;
         d) DATA="$OPTARG" ;;
         e) EXP_NAME_OVERRIDE="$OPTARG" ;;
+        t) TIME_HOURS="$OPTARG" ;;
         r) REQUEUE=true ;;
         *) usage ;;
     esac
@@ -129,10 +137,24 @@ fi
 
 # Build data-specific Hydra args
 DATA_ARGS=""
+GPU_MEM_UTIL=""
 if [[ "$DATA" == *polaris* ]]; then
-    DATA_ARGS="actor_rollout_ref.rollout.gpu_memory_utilization=0.3"
+    GPU_MEM_UTIL="0.3"
 elif [ "$CONFIG" = "cotrain" ]; then
-    DATA_ARGS="actor_rollout_ref.rollout.gpu_memory_utilization=0.4"
+    GPU_MEM_UTIL="0.4"
+fi
+
+# On AWS, enforce minimum gpu_memory_utilization of 0.45 (A100 80GB has more
+# headroom than AMD GPUs, so the lower AMD-tuned values waste KV cache capacity)
+if [ -n "$GPU_MEM_UTIL" ] && [ "$CLUSTER_TYPE" = "aws" ]; then
+    AWS_MIN_GPU_MEM="0.7"
+    if awk "BEGIN {exit !($GPU_MEM_UTIL < $AWS_MIN_GPU_MEM)}"; then
+        GPU_MEM_UTIL="$AWS_MIN_GPU_MEM"
+    fi
+fi
+
+if [ -n "$GPU_MEM_UTIL" ]; then
+    DATA_ARGS="actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEM_UTIL"
 fi
 
 # Build multi-node Hydra args
@@ -179,6 +201,7 @@ else
     echo "Submitting SDPO Training Job"
 fi
 echo "============================================"
+echo "Cluster:    $CLUSTER_TYPE"
 echo "Job name:   $JOB_NAME"
 echo "Partition:  $PARTITION"
 if [ "$NNODES" -ge 2 ]; then
@@ -216,7 +239,7 @@ SBATCH_FLAGS=(
     --nodes="$NNODES"
     --ntasks-per-node=1
     --exclusive
-    --time=12:00:00
+    --time=${TIME_HOURS}:00:00
     --output="${SCRIPT_DIR}/logs/${JOB_NAME}_%j.log"
     --error="${SCRIPT_DIR}/logs/${JOB_NAME}_%j.err"
 )
@@ -225,6 +248,22 @@ SBATCH_FLAGS=(
 if [ "$REQUEUE" = true ]; then
     SBATCH_FLAGS+=(--signal=B:USR1@120)
 fi
+
+# Build the full submit command for logging/reproducibility
+SUBMIT_COMMAND="./submit.sh -c ${CONFIG} -s ${SUFFIX} -d ${DATA} -m ${MODEL} -t ${TIME_HOURS}"
+if [ "$NNODES" -ge 2 ]; then
+    SUBMIT_COMMAND="$SUBMIT_COMMAND -n ${NNODES}"
+fi
+if [ -n "$EXP_NAME_OVERRIDE" ]; then
+    SUBMIT_COMMAND="$SUBMIT_COMMAND -e '${EXP_NAME_OVERRIDE}'"
+fi
+if [ "$REQUEUE" = true ]; then
+    SUBMIT_COMMAND="$SUBMIT_COMMAND -r"
+fi
+if [ -n "$USER_EXTRA_ARGS" ]; then
+    SUBMIT_COMMAND="$SUBMIT_COMMAND $USER_EXTRA_ARGS"
+fi
+LOG_FILE="${SCRIPT_DIR}/logs/${JOB_NAME}_%j.log"
 
 # Build the requeue command that the job will use to resubmit itself
 REQUEUE_CMD="${SCRIPT_DIR}/submit.sh -p ${PARTITION} -c ${CONFIG} -s ${SUFFIX} -n ${NNODES} -m ${MODEL} -d ${DATA}"
@@ -242,12 +281,12 @@ fi
 if [ "$NNODES" -ge 2 ]; then
     # Multi-node: use _multinode_worker.sh (handles Ray cluster setup)
     sbatch "${SBATCH_FLAGS[@]}" \
-        --export="ALL,SCRIPT_DIR=${SCRIPT_DIR},RUN_SCRIPT=${RUN_SCRIPT},SUFFIX=${SUFFIX},EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS},MODEL_PATH=${MODEL},DATA_PATH=${DATA},JOB_NAME=${JOB_NAME},EXP_NAME_OVERRIDE=${EXP_NAME_OVERRIDE},REQUEUE=${REQUEUE},REQUEUE_CMD=${REQUEUE_CMD}" \
+        --export="ALL,SCRIPT_DIR=${SCRIPT_DIR},RUN_SCRIPT=${RUN_SCRIPT},SUFFIX=${SUFFIX},EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS},MODEL_PATH=${MODEL},DATA_PATH=${DATA},JOB_NAME=${JOB_NAME},EXP_NAME_OVERRIDE=${EXP_NAME_OVERRIDE},REQUEUE=${REQUEUE},REQUEUE_CMD=${REQUEUE_CMD},CLUSTER_USE_CONTAINER=${CLUSTER_USE_CONTAINER},CLUSTER_CONDA_ENV=${CLUSTER_CONDA_ENV},SUBMIT_COMMAND=${SUBMIT_COMMAND},LOG_FILE=${LOG_FILE}" \
         "${SCRIPT_DIR}/_multinode_worker.sh"
 else
     # Single-node: inline sbatch script
     sbatch "${SBATCH_FLAGS[@]}" \
-        --export="ALL,EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS},MODEL_PATH=${MODEL},DATA_PATH=${DATA},JOB_NAME=${JOB_NAME},EXP_NAME_OVERRIDE=${EXP_NAME_OVERRIDE}" \
+        --export="ALL,EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS},MODEL_PATH=${MODEL},DATA_PATH=${DATA},JOB_NAME=${JOB_NAME},EXP_NAME_OVERRIDE=${EXP_NAME_OVERRIDE},CLUSTER_USE_CONTAINER=${CLUSTER_USE_CONTAINER},CLUSTER_CONDA_ENV=${CLUSTER_CONDA_ENV},SUBMIT_COMMAND=${SUBMIT_COMMAND},LOG_FILE=${LOG_FILE}" \
         <<EOF
 #!/bin/bash
 
@@ -263,6 +302,25 @@ echo "============================================"
 
 cd ${SCRIPT_DIR}
 
+# Activate conda env if specified (AWS cluster)
+if [ -n "${CLUSTER_CONDA_ENV}" ]; then
+    eval "\$(conda shell.bash hook)"
+    conda activate ${CLUSTER_CONDA_ENV}
+    echo "Activated conda env: ${CLUSTER_CONDA_ENV}"
+    # Clear AMD/ROCm env vars that conflict with NVIDIA/CUDA
+    unset ROCR_VISIBLE_DEVICES 2>/dev/null || true
+    unset HIP_VISIBLE_DEVICES 2>/dev/null || true
+fi
+
+# Clear stale Ray state from previous jobs on this node
+ray stop --force 2>/dev/null || true
+
+if [ "${CLUSTER_USE_CONTAINER}" = true ]; then
+    RUN_CMD="./container_exec.sh ./${RUN_SCRIPT} ${SUFFIX}"
+else
+    RUN_CMD="./${RUN_SCRIPT} ${SUFFIX}"
+fi
+
 if [ "${REQUEUE}" = true ]; then
     # Trap SIGUSR1 sent by SLURM before time limit
     requeue() {
@@ -276,10 +334,10 @@ if [ "${REQUEUE}" = true ]; then
     trap requeue USR1
 
     # Run in background so the trap can fire while we wait
-    ./container_exec.sh ./${RUN_SCRIPT} ${SUFFIX} &
+    \$RUN_CMD &
     wait \$!
 else
-    ./container_exec.sh ./${RUN_SCRIPT} ${SUFFIX}
+    \$RUN_CMD
 fi
 
 echo "============================================"

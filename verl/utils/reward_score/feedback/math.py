@@ -17,6 +17,8 @@ import re
 import signal
 from typing import Optional
 from math_verify import parse as mv_parse, verify as mv_verify
+from verl.utils.reward_score.prime_math.grader import math_equal
+from math_evaluation import is_equiv as mario_is_equiv
 
 FORMAT_PENALTY = False
 
@@ -132,6 +134,21 @@ def verify(
                 correct = mv_verify(gold_expr, pred_expr)
         except Exception:  # ignore any parsing/verification errors
             pass
+
+    # try sympy-based symbolic equivalence check (handles latex, numerical tolerance, etc.)
+    if not correct and pred != "":
+        try:
+            correct = math_equal(pred, answer, timeout=10.0)
+        except Exception:
+            pass
+
+    # try MARIO_EVAL (robust LaTeX equivalence via latex2sympy + normalization)
+    if not correct and pred != "":
+        try:
+            correct = mario_is_equiv(answer, pred)
+        except Exception:
+            pass
+
     return correct, pred
 
 

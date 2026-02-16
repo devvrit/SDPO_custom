@@ -6,12 +6,20 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 # export RAY_DEBUG=1
 ulimit -c 0
 
+# Add MARIO_EVAL to PYTHONPATH for robust math equivalence checking
+MARIO_EVAL_ROOT="$(dirname "$PROJECT_ROOT")/MARIO_EVAL"
+if [ -d "$MARIO_EVAL_ROOT" ]; then
+    export PYTHONPATH="${MARIO_EVAL_ROOT}:${MARIO_EVAL_ROOT}/latex2sympy:${PYTHONPATH}"
+fi
+
 export WANDB_MODE=online
 export WANDB_ENTITY="tinker-sft" # team
 export EXPERIMENT=${1:-"experiment"}
 CONFIG_NAME=${2:-"ppo_trainer"}
 export TASK=${3:-"datasets/ttcs/lasgroup_verifiable-corpus_math-ai_math500_1000"}
-export SSL_CERT_FILE=${PROJECT_ROOT}/cacert.pem
+if [ -f "${PROJECT_ROOT}/cacert.pem" ]; then
+    export SSL_CERT_FILE=${PROJECT_ROOT}/cacert.pem
+fi
 
 # removes the first three arguments from the command line
 if [ "$#" -ge 3 ]; then

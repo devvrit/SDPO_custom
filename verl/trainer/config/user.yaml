@@ -61,6 +61,7 @@ trainer:
   nnodes: 1
   save_freq: 10
   test_freq: 20
+  log_trace_interval: 15
   max_actor_ckpt_to_keep: 1
   total_epochs: 30
   default_local_dir: ${vars.ckpt_dir}/${trainer.experiment_name}  # experiment_name needs to be a unique identifier

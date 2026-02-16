@@ -18,7 +18,9 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -70,6 +72,8 @@ from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -602,7 +606,7 @@ class RayPPOTrainer:
         # Collect selected indices: up to n_per_prompt per UID
         selected_indices = []
         for uid in selected_uids:
-            indices = uid_to_indices[uid][:n_per_prompt]
+            indices = uid_to_indices[uid][-n_per_prompt:]
             selected_indices.extend(indices)
 
         if not selected_indices:
@@ -610,7 +614,7 @@ class RayPPOTrainer:
 
         # Build student traces table
         has_interrupted = "interrupted" in batch.non_tensor_batch
-        student_columns = ["step", "uid", "sample_idx", "acc", "prompt_raw", "response_raw"]
+        student_columns = ["step", "uid", "sample_idx", "acc", "ground_truth", "prompt_raw", "response_raw"]
         if has_interrupted:
             student_columns.extend(["interrupted", "phase1_len", "phase2_len"])
         student_table = wandb.Table(columns=student_columns)
@@ -641,7 +645,8 @@ class RayPPOTrainer:
             else:
                 acc = float(batch.batch["token_level_scores"][i].sum().item())
 
-            row = [step, str(uids[i]), i, acc, prompt_raw, response_raw]
+            gt = batch.non_tensor_batch["reward_model"][i]["ground_truth"]
+            row = [step, str(uids[i]), i, acc, str(gt), prompt_raw, response_raw]
             if has_interrupted:
                 row.append(bool(batch.non_tensor_batch["interrupted"][i]))
                 row.append(int(batch.non_tensor_batch.get("phase1_length", np.zeros(len(uids)))[i]))
@@ -781,7 +786,12 @@ class RayPPOTrainer:
     @staticmethod
     def _remove_thinking_trace(text: str) -> str:
         """Remove <think>...</think> tags and their content from text."""
-        return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+        # Remove explicit <think>...</think> blocks
+        text = re.sub(r'<think>.*?(?:</think>\s*|$)', '', text, flags=re.DOTALL)
+        # Also handle orphaned thinking at the start of text (when <think> was
+        # part of the prompt, not the response, so only </think> appears).
+        text = re.sub(r'^.*?</think>\s*', '', text, flags=re.DOTALL)
+        return text.strip()
 
     def _get_solution(
         self,
@@ -805,6 +815,85 @@ class RayPPOTrainer:
         return solution_str
 
 
+    def _generate_external_feedback(
+        self,
+        batch: DataProto,
+        response_texts: list[str],
+        prompt_texts: list[str],
+        self_distillation_cfg,
+    ) -> list[Optional[str]]:
+        """Generate group-level feedback via external model (Gemini API).
+
+        Groups samples by UID, extracts summaries, calls the Gemini API
+        concurrently for each group, and maps results back to per-sample list.
+
+        Returns:
+            List of feedback strings (or None) of length batch_size.
+        """
+        from verl.utils.external_feedback import generate_external_feedback_for_groups
+
+        batch_size = batch.batch.batch_size[0]
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY environment variable not set. "
+                "Required when use_external_feedback=True."
+            )
+
+        # Build uid -> indices mapping
+        uids = batch.non_tensor_batch["uid"]
+        uid_to_indices: dict[Any, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid_to_indices[uid].append(idx)
+
+        # Extract ground truths
+        ground_truths = []
+        for i in range(batch_size):
+            rm_info = batch.non_tensor_batch.get("reward_model", None)
+            if rm_info is not None and isinstance(rm_info, (list, tuple)):
+                item = rm_info[i] if i < len(rm_info) else {}
+            elif rm_info is not None and isinstance(rm_info, dict):
+                item = {k: v[i] if isinstance(v, (list, tuple)) and i < len(v) else v for k, v in rm_info.items()}
+            else:
+                item = {}
+            if isinstance(item, dict):
+                ground_truths.append(item.get("ground_truth", ""))
+            else:
+                ground_truths.append("")
+
+        coro = generate_external_feedback_for_groups(
+            uid_to_indices=dict(uid_to_indices),
+            response_texts=response_texts,
+            prompt_texts=prompt_texts,
+            ground_truths=ground_truths,
+            template=self_distillation_cfg.external_feedback_prompt_template,
+            temperature=self_distillation_cfg.external_feedback_temperature,
+            max_output_tokens=self_distillation_cfg.external_feedback_max_tokens,
+            model=self_distillation_cfg.external_feedback_model,
+            max_retries=self_distillation_cfg.external_feedback_max_retries,
+            retry_delay_min=self_distillation_cfg.external_feedback_retry_delay_min,
+            retry_delay_max=self_distillation_cfg.external_feedback_retry_delay_max,
+            filter_incomplete=self_distillation_cfg.external_feedback_filter_incomplete_traces,
+            max_concurrent_requests=self_distillation_cfg.get("external_feedback_max_concurrent_requests", 600),
+        )
+
+        # Handle event loop edge case (may already be running in async context)
+        try:
+            loop = asyncio.get_running_loop()
+            import nest_asyncio
+            nest_asyncio.apply()
+            uid_to_feedback = loop.run_until_complete(coro)
+        except RuntimeError:
+            uid_to_feedback = asyncio.run(coro)
+
+        # Map group-level feedback back to per-sample list
+        feedback_list: list[Optional[str]] = [None] * batch_size
+        for idx, uid in enumerate(uids):
+            feedback_list[idx] = uid_to_feedback.get(uid, None)
+
+        return feedback_list
+
     def _maybe_build_self_distillation_batch(
         self,
         batch: DataProto,
@@ -823,12 +912,27 @@ class RayPPOTrainer:
         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
-        # Extract feedback if available and include_environment_feedback is enabled
-        feedback_list = self._collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
-            batch_size=batch_size,
-        )
+        # Extract feedback: either from external model (Gemini) or environment
+        use_external = self_distillation_cfg.get("use_external_feedback", False)
+        if use_external:
+            ext_fb_t0 = time.time()
+            feedback_list = self._generate_external_feedback(batch, response_texts, prompt_texts, self_distillation_cfg)
+            ext_fb_time = time.time() - ext_fb_t0
+            # Hard fail if any group didn't get feedback after all retries
+            failed_indices = [i for i, fb in enumerate(feedback_list) if fb is None]
+            if failed_indices:
+                failed_uids = sorted(set(batch.non_tensor_batch["uid"][i] for i in failed_indices))
+                raise RuntimeError(
+                    f"External feedback generation failed for {len(failed_uids)} UID group(s) "
+                    f"after all retries: {failed_uids}"
+                )
+        else:
+            feedback_list = self._collect_feedback(
+                include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                batch_size=batch_size,
+            )
+            ext_fb_time = None
 
         success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
         solution_strs = [
@@ -845,36 +949,48 @@ class RayPPOTrainer:
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            has_solution = solution_strs[i] is not None
-            has_feedback = feedback_list[i] is not None
-            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
 
-            # If feedback_only_without_solution is True, only use feedback when no solution exists
-            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
-
-            # build solution section
-            solution_section = ""
-            if has_solution:
-                solution_section = self_distillation_cfg.solution_template.format(
-                    successful_previous_attempt=solution_strs[i]
-                )
-
-            # build feedback section
-            feedback_section = ""
-            if use_feedback:
-                feedback_section = self_distillation_cfg.feedback_template.format(
-                    feedback_raw=feedback_list[i]
-                )
-
-            # combine solution and feedback sections
-            if use_feedback or has_solution:
-                reprompt_text = self_distillation_cfg.reprompt_template.format(
-                    prompt=prompt_texts[i],
-                    solution=solution_section,
-                    feedback=feedback_section,
+            if use_external and feedback_list[i] is not None:
+                # Use the proxy teacher template (matching tinker codebase):
+                # problem + Gemini-generated feedback → "now solve step by step"
+                from verl.utils.external_feedback import DEFAULT_PROXY_TEACHER_TEMPLATE
+                proxy_template = self_distillation_cfg.get(
+                    "external_feedback_proxy_teacher_template", ""
+                ) or DEFAULT_PROXY_TEACHER_TEMPLATE
+                reprompt_text = proxy_template.format(
+                    problem=prompt_texts[i],
+                    feedback=feedback_list[i],
                 )
             else:
-                reprompt_text = prompt_texts[i]
+                has_solution = solution_strs[i] is not None
+                has_feedback = feedback_list[i] is not None
+                feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+
+                # If feedback_only_without_solution is True, only use feedback when no solution exists
+                use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+
+                # build solution section
+                solution_section = ""
+                if has_solution:
+                    solution_section = self_distillation_cfg.solution_template.format(
+                        successful_previous_attempt=solution_strs[i]
+                    )
+
+                # build feedback section
+                feedback_section = ""
+                if use_feedback:
+                    fb_template = self_distillation_cfg.feedback_template
+                    feedback_section = fb_template.format(feedback_raw=feedback_list[i])
+
+                # combine solution and feedback sections
+                if use_feedback or has_solution:
+                    reprompt_text = self_distillation_cfg.reprompt_template.format(
+                        prompt=prompt_texts[i],
+                        solution=solution_section,
+                        feedback=feedback_section,
+                    )
+                else:
+                    reprompt_text = prompt_texts[i]
 
             return system_messages + [
                 {"role": "user", "content": reprompt_text},
@@ -901,10 +1017,7 @@ class RayPPOTrainer:
         # When thinking is enabled, the student prompt has <think> appended after
         # apply_chat_template (in single_turn_agent_loop). Do the same for the teacher
         # so the response tokens are contextualised identically.
-        # But skip this if thinking was stripped from the demonstration, since the
-        # response no longer starts with thinking content.
-        remove_thinking = self_distillation_cfg.get("remove_thinking_from_demonstration", False)
-        if enable_thinking and not remove_thinking:
+        if enable_thinking:
             think_token_ids = self.tokenizer.encode("<think>", add_special_tokens=False)
             think_ids = torch.tensor([think_token_ids] * teacher_prompt_ids.shape[0], device=device)
             think_mask = torch.ones_like(think_ids)
@@ -915,19 +1028,25 @@ class RayPPOTrainer:
         teacher_attention_mask = torch.cat([teacher_prompt_mask, response_mask], dim=1)
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
-        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
-        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
-        feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
-            for i in range(batch_size)
-        ]
-
-        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-            device=device
-        )
+        # Compute which samples actually use feedback and the distillation mask
+        if use_external:
+            # When using external feedback, mask = feedback received from Gemini
+            feedback_used = [feedback_list[i] is not None for i in range(batch_size)]
+            self_distillation_mask = torch.tensor(
+                feedback_used, dtype=torch.float32, device=device
+            )
+        else:
+            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+            feedback_used = [
+                feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+                for i in range(batch_size)
+            ]
+            # self_distillation_mask is True if sample has a solution OR feedback is used
+            self_distillation_mask = torch.tensor(
+                [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+                dtype=torch.float32,
+                device=device
+            )
 
         uids = set(batch.non_tensor_batch["uid"])
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
@@ -940,6 +1059,31 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
+
+        # Add external feedback metrics when applicable
+        if use_external:
+            # Fraction of UID groups that received non-None feedback
+            uid_list = list(batch.non_tensor_batch["uid"])
+            uid_set = set(uid_list)
+            uid_feedback_map: dict[Any, Optional[str]] = {}
+            for idx, uid in enumerate(uid_list):
+                if uid not in uid_feedback_map:
+                    uid_feedback_map[uid] = feedback_list[idx]
+            groups_with_fb = sum(1 for fb in uid_feedback_map.values() if fb is not None)
+            groups_without_fb = len(uid_set) - groups_with_fb
+            metrics["self_distillation/external_feedback_group_fraction"] = groups_with_fb / len(uid_set) if uid_set else 0.0
+            metrics["self_distillation/external_feedback_group_failure_fraction"] = groups_without_fb / len(uid_set) if uid_set else 0.0
+
+            # Average character length of non-None feedback
+            fb_lengths = [len(f) for f in feedback_list if f is not None]
+            metrics["self_distillation/external_feedback_avg_char_length"] = (
+                sum(fb_lengths) / len(fb_lengths) if fb_lengths else 0.0
+            )
+
+            # Wall clock time for all API calls
+            if ext_fb_time is not None:
+                metrics["self_distillation/external_feedback_api_time_sec"] = ext_fb_time
+
         return DataProto.from_dict(tensors={
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
@@ -1726,6 +1870,21 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
             group_name=self.config.trainer.get("group_name", None),
         )
+
+        # Log reproducibility info (command, checkpoint dir, log file) to wandb
+        if "wandb" in logger.logger:
+            import wandb
+
+            repro_info = {}
+            submit_cmd = os.environ.get("SUBMIT_COMMAND")
+            if submit_cmd:
+                repro_info["submit_command"] = submit_cmd
+            log_file = os.environ.get("LOG_FILE")
+            if log_file:
+                slurm_job_id = os.environ.get("SLURM_JOB_ID", "")
+                repro_info["log_file"] = log_file.replace("%j", slurm_job_id)
+            repro_info["checkpoint_dir"] = self.config.trainer.default_local_dir
+            wandb.config.update({"reproducibility": repro_info}, allow_val_change=True)
 
         self.global_steps = 0
 

@@ -124,6 +124,40 @@ self_distillation:
   # Requires include_environment_feedback=True to have any effect
   environment_feedback_only_without_solution: True
 
+  # When True, generate group-level feedback via external model (Gemini API)
+  # instead of per-sample environment feedback. Requires GEMINI_API_KEY env var.
+  use_external_feedback: false
+
+  # Gemini model to use for external feedback generation
+  external_feedback_model: "gemini-3-flash-preview"
+
+  # Sampling temperature for external feedback model
+  external_feedback_temperature: 0.0
+
+  # Maximum output tokens for external feedback model
+  external_feedback_max_tokens: 14000
+
+  # Maximum number of retry attempts for external feedback API calls
+  external_feedback_max_retries: 3
+
+  # Random retry delay range in seconds (uniform between min and max)
+  external_feedback_retry_delay_min: 15.0
+
+  # Maximum retry delay in seconds
+  external_feedback_retry_delay_max: 45.0
+
+  # Maximum number of concurrent Gemini API requests (semaphore-based)
+  external_feedback_max_concurrent_requests: 600
+
+  # Whether to filter out incomplete traces (without </think>) when extracting summaries
+  external_feedback_filter_incomplete_traces: true
+
+  # Custom prompt template for external feedback (sent to Gemini); empty string uses default
+  external_feedback_prompt_template: ""
+
+  # Custom proxy teacher template (problem + feedback → solve); empty string uses default
+  external_feedback_proxy_teacher_template: ""
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
@@ -140,28 +174,17 @@ self_distillation:
   # Whether to normalize per-token SDPO losses by std before aggregation
   std_normalize_sdpo: false
 
+  # Only distill at tokens where sign(advantage) == sign(teacher_logp - student_logp)
+  advantage_sign_masking: false
+
   # Epsilon for std normalization
   std_normalize_eps: 1.0e-8
 
-  # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
-  reprompt_template: |-
-    {prompt}{solution}{feedback}
-
-    Correctly solve the original question.
-
-  # Solution template - available variables: successful_previous_attempt
-  solution_template: |-
-
-    Correct solution:
-
-    {successful_previous_attempt}
-
-  # Feedback template - available variables: feedback_raw
-  feedback_template: |-
-
-    The following is feedback from your unsuccessful earlier attempt:
-
-    {feedback_raw}
+  # Prompt templates - canonical source of truth is verl/workers/config/actor.py
+  # These must be present for Hydra struct mode. Keep in sync with actor.py.
+  reprompt_template: "{prompt}{solution}{feedback}\n\nNow solve the original problem in a fresh way. Do not mention or refer to the critique or the revision process. Use the feedback/critique only to improve correctness, clarity, and reasoning. Avoid using phrases like \"Correctly applying the critique...\" or \"Reexamining my earlier solution...\", \"Given correct answer:..\" etc., as the final answer should stand alone. Basically, reading your thought process and summarized solution, it should not be apparent that you had access to privileged information, though you can use and refer the privileged information to help guide your attempt. Also, during generation, if you get interrupted due to limited time to think, just produce a summarized answer based on your thinking so far, without going in a loop to think much more. Now let's think step by step and output the final answer within \\boxed{{}}.\n"
+  solution_template: "\n\nHere's a reference correct solution to help you approach the above problem:\n\n{successful_previous_attempt}\n\n"
+  feedback_template: "\n\nThe following is feedback from your unsuccessful earlier attempt:\n{feedback_raw}\n\n"
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

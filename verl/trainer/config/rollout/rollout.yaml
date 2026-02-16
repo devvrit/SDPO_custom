@@ -347,7 +347,7 @@ interruption:
   max_answer_tokens: 2048
 
   # text injected when model doesn't produce </think> by T1
-  interruption_text: "\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.</think>\n"
+  interruption_text: "\nConsidering the limited time by the user, I have to give the summarized solution based on the thinking directly now.</think>\n"
 
   # token that signals end of thinking phase
   think_end_token: "</think>"

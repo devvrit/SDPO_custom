@@ -79,22 +79,34 @@ class SelfDistillationConfig(BaseConfig):
         "Correctly solve the original question.\n"
     )
     solution_template: str = (
-        "\n"
-        "Correct solution:\n\n"
+        "\n\n"
+        "Here's a reference correct solution to help you approach the above problem:\n\n"
         "{successful_previous_attempt}\n\n"
     )
     feedback_template: str = (
-        "\n"
-        "The following is feedback from your unsuccessful earlier attempt:\n\n"
+        "\n\n"
+        "The following is feedback from your unsuccessful earlier attempt:\n"
         "{feedback_raw}\n\n"
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    use_external_feedback: bool = False
+    external_feedback_model: str = "gemini-3-flash-preview"
+    external_feedback_temperature: float = 0.0
+    external_feedback_max_tokens: int = 14000
+    external_feedback_max_retries: int = 3
+    external_feedback_retry_delay_min: float = 15.0
+    external_feedback_retry_delay_max: float = 45.0
+    external_feedback_max_concurrent_requests: int = 600
+    external_feedback_filter_incomplete_traces: bool = True
+    external_feedback_prompt_template: str = ""  # empty => use DEFAULT_EXTERNAL_FEEDBACK_PROMPT_TEMPLATE
+    external_feedback_proxy_teacher_template: str = ""  # empty => use DEFAULT_PROXY_TEACHER_TEMPLATE
     rl_loss_coef: float = 0.0
     teacher_rl_loss_coef: float = 0.0  # Weight for teacher-context RL loss (0 = disabled)
     teacher_rl_is_clip: float = 5.0  # Clip IS weight stopgrad(p_student/p_teacher) for stability
     std_normalize_sdpo: bool = False
     std_normalize_eps: float = 1e-8
+    advantage_sign_masking: bool = False  # Only distill at tokens where sign(advantage) == sign(teacher_logp - student_logp)
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -115,6 +127,10 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.external_feedback_max_retries < 1:
+            raise ValueError(
+                f"self_distillation.external_feedback_max_retries must be >= 1, got {self.external_feedback_max_retries}"
+            )
 
 
 @dataclass

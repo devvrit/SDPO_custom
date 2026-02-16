@@ -1140,6 +1140,7 @@ def compute_self_distillation_loss(
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
     index: Optional[np.ndarray] = None,
+    advantages: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1244,6 +1245,7 @@ def compute_self_distillation_loss(
             # Global std across all sequence-level losses in the batch
             global_std = seq_losses.std().detach() if bsz > 1 else torch.tensor(1.0, device=per_token_loss.device, dtype=per_token_loss.dtype)
 
+            # if index is not None and False:
             if index is not None:
                 # Per-group means (center within each uid group)
                 id2losses = defaultdict(list)
@@ -1272,6 +1274,20 @@ def compute_self_distillation_loss(
         metrics["self_distillation/sdpo_loss_post_norm"] = post_norm_mean
         metrics["self_distillation/sdpo_loss_post_norm_abs"] = post_norm_abs_mean
         metrics["self_distillation/loss_std"] = global_std.item()
+
+    # Advantage-sign masking: only distill at tokens where the RL advantage sign
+    # agrees with the teacher-student log-prob gap direction.
+    if getattr(self_distillation_config, "advantage_sign_masking", False) and advantages is not None:
+        with torch.no_grad():
+            adv_sign = torch.sign(advantages)
+            diff_sign = torch.sign(teacher_log_probs - student_log_probs)
+            sign_agree = (adv_sign == diff_sign).float()
+            # Keep tokens where advantage is exactly 0 (no RL signal)
+            sign_agree = torch.where(adv_sign == 0, torch.ones_like(sign_agree), sign_agree)
+        tokens_before = loss_mask.sum().item()
+        loss_mask = loss_mask * sign_agree
+        tokens_after = loss_mask.sum().item()
+        metrics["self_distillation/adv_sign_mask_keep_ratio"] = tokens_after / max(tokens_before, 1.0)
 
     loss = agg_loss(
         loss_mat=per_token_loss,
