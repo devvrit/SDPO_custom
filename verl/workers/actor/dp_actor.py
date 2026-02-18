@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 import time
+
 from types import SimpleNamespace
 from typing import Optional
 
@@ -768,7 +769,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for mb_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
@@ -819,10 +820,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
-
                     # Extract pre-computed rollout correction weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
                     if self_distillation_enabled:
@@ -833,6 +831,7 @@ class DataParallelPPOActor(BasePPOActor):
                             "position_ids": model_inputs["teacher_position_ids"],
                         }
                         teacher_model = self.teacher_module or self.actor_module
+                        teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                         if teacher_regularization == "trust-region" and (
                             self.teacher_module is None or self.teacher_module is self.actor_module
                         ):
@@ -841,8 +840,6 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_rl_loss_coef = getattr(self_distillation_cfg, "teacher_rl_loss_coef", 0.0)
 
                         # Teacher forward with no_grad for SDPO (cheap, no activation storage).
-                        # When teacher_rl_loss_coef > 0, a second forward WITH grad happens
-        a                # later in a separate backward pass to avoid holding both graphs at once.
                         _t0 = time.monotonic()
                         with torch.no_grad():
                             teacher_outputs = self._forward_micro_batch(
@@ -858,6 +855,7 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+
                         sdpo_loss, sdpo_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
                             teacher_log_probs=teacher_log_prob,

@@ -15,7 +15,7 @@ DATA_PATH="${DATA_PATH:-datasets/tooluse}"
 # Hyperparameters
 TRAIN_BATCH_SIZE=32
 ROLLOUT_BATCH_SIZE=8
-LR=1e-5
+LR=4e-6
 LAMBDA=0.0
 CLIP_ADV_HIGH=null
 DONTS_REPROMPT_ON_SELF_SUCCESS=True
@@ -84,7 +84,7 @@ vars.ckpt_dir=$CKPT_DIR \
 vars.task=$DATA_PATH \
 custom_reward_function.path=$CUSTOM_REWARD_PATH \
 actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
-algorithm.adv_estimator=grpo_hybrid \
+algorithm.adv_estimator=grpo \
 actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
 actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=true"
 

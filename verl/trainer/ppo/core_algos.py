@@ -1126,6 +1126,118 @@ def agg_loss(
     return loss
 
 
+def compute_sdpo_norm_stats(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    index: Optional[np.ndarray],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-group mean and std for SDPO advantage normalization.
+
+    Called at the mini-batch level (before backward) so that normalization
+    statistics are computed across all sequences in the mini-batch, matching
+    how GRPO computes RL advantages at the batch level.
+
+    Args:
+        values: (bs, seq_len) proxy SDPO advantages (e.g. student_log_probs - teacher_log_probs).
+        mask: (bs, seq_len) loss mask (response_mask * self_distillation_mask).
+        index: (bs,) uid group IDs for per-group stats, or None for global.
+
+    Returns:
+        group_means: (bs,) per-sequence group mean.
+        group_stds: (bs,) per-sequence group std.
+    """
+    with torch.no_grad():
+        bsz = values.shape[0]
+        token_counts = mask.sum(dim=-1).clamp(min=1.0)
+        seq_values = (values * mask).sum(dim=-1) / token_counts
+        # Sequences with no unmasked tokens (e.g. self_distillation_mask=0) get
+        # an artificial seq_value of 0.  Exclude them from group stats so they
+        # don't deflate the std.
+        active = mask.sum(dim=-1) > 0  # (bsz,)
+
+        if index is not None:
+            id2vals: dict[Any, list[torch.Tensor]] = defaultdict(list)
+            id2mean: dict[Any, torch.Tensor] = {}
+            id2std: dict[Any, torch.Tensor] = {}
+            for i in range(bsz):
+                if active[i]:
+                    id2vals[index[i]].append(seq_values[i])
+            for idx in id2vals:
+                if len(id2vals[idx]) == 1:
+                    id2mean[idx] = torch.tensor(0.0, device=values.device, dtype=values.dtype)
+                    id2std[idx] = torch.tensor(1.0, device=values.device, dtype=values.dtype)
+                else:
+                    group_tensor = torch.stack(id2vals[idx])
+                    id2mean[idx] = torch.mean(group_tensor)
+                    id2std[idx] = torch.std(group_tensor)
+            group_means = torch.zeros(bsz, device=values.device, dtype=values.dtype)
+            group_stds = torch.ones(bsz, device=values.device, dtype=values.dtype)
+            for i in range(bsz):
+                if index[i] in id2mean:
+                    group_means[i] = id2mean[index[i]]
+                    group_stds[i] = id2std[index[i]]
+                # else: inactive sequence with no active group members → stays 0/1
+        else:
+            active_vals = seq_values[active]
+            global_mean = active_vals.mean() if active_vals.numel() > 0 else torch.tensor(0.0, device=values.device, dtype=values.dtype)
+            global_std = active_vals.std() if active_vals.numel() > 1 else torch.tensor(1.0, device=values.device, dtype=values.dtype)
+            group_means = global_mean.expand(bsz)
+            group_stds = global_std.expand(bsz)
+
+        return group_means, group_stds
+
+
+def _normalize_sdpo_advantage(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    index: Optional[np.ndarray],
+    eps: float = 1e-8,
+    group_means: Optional[torch.Tensor] = None,
+    group_stds: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Per-group centering + per-group std normalization of per-position SDPO advantage values.
+
+    Matches the standard GRPO normalization pattern: each uid group is independently
+    standardized (centered by group mean, divided by group std).
+
+    Args:
+        values: (bs, seq_len) per-token advantage or expected advantage values.
+        mask: (bs, seq_len) loss mask (should include self_distillation_mask).
+        index: (bs,) uid group IDs for per-group normalization, or None for global.
+        eps: small constant for numerical stability.
+        group_means: (bs,) optional pre-computed per-sequence group means.
+        group_stds: (bs,) optional pre-computed per-sequence group stds.
+
+    Returns:
+        normalized: (bs, seq_len) normalized values.
+        norm_metrics: dict with normalization statistics for logging.
+    """
+    norm_metrics: dict[str, Any] = {}
+
+    with torch.no_grad():
+        # Log pre-normalization stats
+        valid = values[mask.bool()]
+        norm_metrics["self_distillation/sdpo_advantage_pre_norm"] = valid.mean().item() if valid.numel() > 0 else float('nan')
+
+        # Use pre-computed stats if provided, otherwise compute from micro-batch
+        if group_means is None or group_stds is None:
+            group_means, group_stds = compute_sdpo_norm_stats(values, mask, index)
+
+        norm_metrics["self_distillation/sdpo_advantage_group_std_mean"] = group_stds.mean().item()
+
+    # Apply normalization: per-group center, per-group std scale
+    normalized = (values - group_means.unsqueeze(-1)) / (group_stds.unsqueeze(-1) + eps)
+
+    # Log post-normalization stats
+    with torch.no_grad():
+        post_valid = normalized[mask.bool()]
+        _has_post = post_valid.numel() > 0
+        norm_metrics["self_distillation/sdpo_advantage_post_norm"] = post_valid.mean().item() if _has_post else float('nan')
+        norm_metrics["self_distillation/sdpo_advantage_post_norm_abs"] = post_valid.abs().mean().item() if _has_post else float('nan')
+
+    return normalized, norm_metrics
+
+
 def compute_self_distillation_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -1141,6 +1253,8 @@ def compute_self_distillation_loss(
     rollout_is_weights: Optional[torch.Tensor] = None,
     index: Optional[np.ndarray] = None,
     advantages: Optional[torch.Tensor] = None,
+    sdpo_norm_mean: Optional[torch.Tensor] = None,
+    sdpo_norm_std: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1206,10 +1320,86 @@ def compute_self_distillation_loss(
             kl_loss = torch.lerp(kl_student, kl_teacher, alpha)  # Compute the Generalized Jensen-Shannon Divergence
 
         per_token_loss = kl_loss.sum(-1)
+        if getattr(self_distillation_config, "std_normalize_sdpo", False):
+            sdpo_norm_eps = getattr(self_distillation_config, "std_normalize_eps", 1e-8)
+
+            # Compute log_ratio and p_weight (all detached — only student_distill_log_probs has gradient)
+            if self_distillation_config.alpha == 1.0:
+                log_ratio = -(student_distill_log_probs - teacher_distill_log_probs).detach()
+                p_weight = student_distill_log_probs.exp().detach()
+            elif self_distillation_config.alpha == 0.0:
+                log_ratio = -(teacher_distill_log_probs - student_distill_log_probs).detach()
+                p_weight = teacher_distill_log_probs.exp().detach()
+            else:
+                log_ratio = -(student_distill_log_probs - mixture_log_probs).detach()
+                p_weight = mixture_log_probs.exp().detach()
+
+            # Per-position p-weighted mean and variance of log_ratio
+            mu = (p_weight * log_ratio).sum(-1, keepdim=True)                    # (bs, seq_len, 1)
+            var = (p_weight * (log_ratio - mu).pow(2)).sum(-1, keepdim=True)      # (bs, seq_len, 1)
+            sigma = var.sqrt().clamp(min=sdpo_norm_eps)                           # (bs, seq_len, 1)
+
+            # Normalized advantage (all detached)
+            # Zero out positions where sigma is degenerate (top-k log_ratios nearly identical,
+            # no meaningful distributional signal for the gradient).
+            degenerate = (var.sqrt() < 1e-3)  # (bs, seq_len, 1)
+            A_sdpo = torch.where(degenerate, torch.zeros_like(log_ratio), (log_ratio - mu) / sigma)  # (bs, seq_len, topk)
+
+            # Loss: p * A * log_p_student (only student_distill_log_probs has gradient)
+            per_token_loss = -(p_weight * A_sdpo * student_distill_log_probs).sum(-1)  # (bs, seq_len)
+
+            # Log metrics + debug prints
+            with torch.no_grad():
+                mask_3d = loss_mask.unsqueeze(-1).expand_as(A_sdpo)
+                valid_A = A_sdpo[mask_3d.bool()]
+                valid_mu = mu.squeeze(-1)[loss_mask.bool()]
+                valid_sigma = sigma.squeeze(-1)[loss_mask.bool()]
+                _has_valid = valid_A.numel() > 0
+                metrics["self_distillation/sdpo_advantage_post_norm"] = valid_A.mean().item() if _has_valid else float('nan')
+                metrics["self_distillation/sdpo_advantage_post_norm_abs"] = valid_A.abs().mean().item() if _has_valid else float('nan')
+                metrics["self_distillation/sdpo_mu_mean"] = valid_mu.mean().item() if _has_valid else float('nan')
+                metrics["self_distillation/sdpo_sigma_mean"] = valid_sigma.mean().item() if _has_valid else float('nan')
+                metrics["self_distillation/sdpo_sigma_min"] = valid_sigma.min().item() if _has_valid else float('nan')
+
+                # Log degenerate position stats
+                if _has_valid:
+                    degen_2d = degenerate.squeeze(-1) & loss_mask.bool()  # (bs, seq_len)
+                    n_valid = loss_mask.bool().sum().item()
+                    n_degen = degen_2d.sum().item()
+                    degen_frac = n_degen / max(n_valid, 1)
+                    degen_mu_mean = mu.squeeze(-1)[degen_2d].mean().item() if degen_2d.any() else 0.0
+                else:
+                    n_valid = 0
+                    n_degen = 0
+                    degen_frac = float('nan')
+                    degen_mu_mean = float('nan')
+                metrics["self_distillation/sdpo_degenerate_fraction"] = degen_frac
+                metrics["self_distillation/sdpo_degenerate_mu_mean"] = degen_mu_mean
+
+                import os
+                if os.environ.get("RANK", "0") == "0" and _has_valid:
+                    m2d = loss_mask.bool()
+                    valid_loss = per_token_loss[m2d]
+                    old_kl = kl_loss.sum(-1)[m2d]
+                    print(f"\n[SDPO DEBUG] shapes: kl_loss={kl_loss.shape} log_ratio={log_ratio.shape}")
+                    print(f"  mu (per-pos KL): min={valid_mu.min():.6f} max={valid_mu.max():.6f} mean={valid_mu.mean():.6f}")
+                    print(f"  sigma: min={valid_sigma.min():.6f} max={valid_sigma.max():.6f} mean={valid_sigma.mean():.6f}")
+                    print(f"  A_sdpo: min={valid_A.min():.4f} max={valid_A.max():.4f} abs_mean={valid_A.abs().mean():.4f}")
+                    print(f"  degenerate: {n_degen}/{int(n_valid)} ({degen_frac:.4f}), mu_mean={degen_mu_mean:.6f}")
+                    print(f"  per_token_loss: min={valid_loss.min():.6f} max={valid_loss.max():.6f} mean={valid_loss.mean():.6f}")
+                    print(f"  old KL (comparison): min={old_kl.min():.6f} max={old_kl.max():.6f} mean={old_kl.mean():.6f}\n")
     else:
         assert self_distillation_config.alpha == 1.0, "Only reverse KL is supported for non-full-logit distillation"
-        log_ratio = student_log_probs - teacher_log_probs
-        per_token_loss = log_ratio.detach() * student_log_probs
+        log_ratio = teacher_log_probs - student_log_probs   # R^{SDPO}
+        # Normalize R^{SDPO} (the advantage) before using it in REINFORCE
+        if getattr(self_distillation_config, "std_normalize_sdpo", False):
+            sdpo_norm_eps = getattr(self_distillation_config, "std_normalize_eps", 1e-8)
+            log_ratio, norm_metrics = _normalize_sdpo_advantage(
+                log_ratio, loss_mask, index, sdpo_norm_eps,
+                group_means=sdpo_norm_mean, group_stds=sdpo_norm_std,
+            )
+            metrics.update(norm_metrics)
+        per_token_loss =  - log_ratio.detach() * student_log_probs
 
     is_clip = self_distillation_config.is_clip
     if is_clip is not None:
@@ -1224,56 +1414,6 @@ def compute_self_distillation_loss(
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
-
-    # Normalize per-token losses: subtract per-group mean, divide by global batch std
-    # (analogous to how grpo_hybrid computes advantages)
-    if getattr(self_distillation_config, "std_normalize_sdpo", False):
-        eps = getattr(self_distillation_config, "std_normalize_eps", 1e-8)
-
-        # Compute per-sequence mean loss (mean over tokens per sequence)
-        token_counts = loss_mask.sum(dim=-1).clamp(min=1.0)  # (bs,)
-        seq_losses = (per_token_loss * loss_mask).sum(dim=-1) / token_counts  # (bs,)
-
-        # Log pre-normalization mean
-        valid_losses = per_token_loss[loss_mask.bool()]
-        pre_norm_mean = valid_losses.mean().detach().item() if valid_losses.numel() > 0 else 0.0
-        metrics["self_distillation/sdpo_loss_pre_norm"] = pre_norm_mean
-
-        with torch.no_grad():
-            bsz = seq_losses.shape[0]
-
-            # Global std across all sequence-level losses in the batch
-            global_std = seq_losses.std().detach() if bsz > 1 else torch.tensor(1.0, device=per_token_loss.device, dtype=per_token_loss.dtype)
-
-            # if index is not None and False:
-            if index is not None:
-                # Per-group means (center within each uid group)
-                id2losses = defaultdict(list)
-                for i in range(bsz):
-                    id2losses[index[i]].append(seq_losses[i])
-                group_means = torch.zeros(bsz, device=per_token_loss.device, dtype=per_token_loss.dtype)
-                for i in range(bsz):
-                    group = id2losses[index[i]]
-                    if len(group) == 1:
-                        group_means[i] = 0.0
-                    else:
-                        group_means[i] = torch.mean(torch.stack(group)).detach()
-            else:
-                # Fallback: subtract global mean if no group index available
-                # print("[SDPO normalize] WARNING: no group index (uid) available, falling back to global mean centering")
-                # group_means = seq_losses.mean().detach().expand(bsz)
-                group_means = valid_losses.mean().detach().expand(bsz)  # flat token mean, broadcast
-
-        # Subtract per-group (sequence-level) mean from each token, divide by global std
-        per_token_loss = (per_token_loss - group_means.unsqueeze(-1)) / (global_std + eps)
-
-        # Log post-normalization mean, absolute mean, and std used
-        post_valid = per_token_loss[loss_mask.bool()]
-        post_norm_mean = post_valid.mean().detach().item() if post_valid.numel() > 0 else 0.0
-        post_norm_abs_mean = post_valid.abs().mean().detach().item() if post_valid.numel() > 0 else 0.0
-        metrics["self_distillation/sdpo_loss_post_norm"] = post_norm_mean
-        metrics["self_distillation/sdpo_loss_post_norm_abs"] = post_norm_abs_mean
-        metrics["self_distillation/loss_std"] = global_std.item()
 
     # Advantage-sign masking: only distill at tokens where the RL advantage sign
     # agrees with the teacher-student log-prob gap direction.
