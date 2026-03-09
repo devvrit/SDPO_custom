@@ -149,6 +149,10 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Log ALL trajectories (prompts, responses, teacher prompts, rewards) per step
+  # Saves JSONL files to {ckpt_dir}/{exp_name}/trajectories/ and logs wandb Tables
+  log_all_trajectories: false
+
   # Number of nodes used in the training
   nnodes: 1
 
@@ -215,6 +219,10 @@ trainer:
 
   # Number of response traces per prompt
   log_trace_per_prompt: 2
+
+  # Timeout in seconds for rollout generation. If generation hangs longer than this,
+  # the step is skipped and training continues. Set to -1 to disable. Default: 600 (10 min).
+  generation_timeout: 600
 
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"

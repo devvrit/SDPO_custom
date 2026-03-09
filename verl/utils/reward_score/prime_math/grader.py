@@ -356,6 +356,7 @@ def symbolic_equal(a, b, tolerance, timeout=10.0):
         pass
     except Exception:
         pass
+
     return False
 
 

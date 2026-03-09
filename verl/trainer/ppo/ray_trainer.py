@@ -682,6 +682,109 @@ class RayPPOTrainer:
 
             wandb.log({"debug/teacher_traces": teacher_table}, step=step)
 
+    def _log_all_trajectories(self, batch: DataProto, step: int):
+        """Log ALL trajectories to JSONL files and wandb Tables.
+
+        When trainer.log_all_trajectories=true, saves every sample's prompt,
+        response, teacher prompt, reward, and metadata for offline analysis.
+        """
+        if not self.config.trainer.get("log_all_trajectories", False):
+            return
+
+        import json
+
+        batch_size = batch.batch.batch_size[0]
+        prompts = batch.batch["prompts"]
+        responses = batch.batch["responses"]
+        attention_mask = batch.batch["attention_mask"]
+        prompt_len = prompts.shape[1]
+
+        uids = batch.non_tensor_batch.get("uid", [None] * batch_size)
+        has_acc = "acc" in batch.non_tensor_batch
+        has_teacher = "teacher_input_ids" in batch.batch
+        has_advantages = "advantages" in batch.batch
+
+        if has_teacher:
+            teacher_input_ids = batch.batch["teacher_input_ids"]
+            teacher_attention_mask = batch.batch["teacher_attention_mask"]
+            resp_len = responses.shape[1]
+            teacher_prompt_len = teacher_input_ids.shape[1] - resp_len
+            sd_mask = batch.batch.get("self_distillation_mask", None)
+
+        records = []
+        for i in range(batch_size):
+            # Decode student prompt
+            p_mask = attention_mask[i, :prompt_len]
+            prompt_text = self.tokenizer.decode(prompts[i][p_mask.bool()], skip_special_tokens=True)
+
+            # Decode student response
+            r_mask = attention_mask[i, prompt_len:]
+            response_text = self.tokenizer.decode(responses[i][r_mask.bool()], skip_special_tokens=True)
+
+            # Accuracy / reward
+            if has_acc:
+                acc = float(batch.non_tensor_batch["acc"][i])
+            else:
+                acc = float(batch.batch["token_level_scores"][i].sum().item())
+
+            # Ground truth
+            rm_info = batch.non_tensor_batch.get("reward_model", None)
+            if rm_info is not None:
+                if isinstance(rm_info, (list, tuple, np.ndarray)):
+                    gt = rm_info[i].get("ground_truth", "") if isinstance(rm_info[i], dict) else ""
+                elif isinstance(rm_info, dict):
+                    gt = rm_info.get("ground_truth", "")
+                else:
+                    gt = ""
+            else:
+                gt = ""
+
+            record = {
+                "step": step,
+                "uid": str(uids[i]) if uids[i] is not None else None,
+                "sample_idx": i,
+                "acc": acc,
+                "ground_truth": str(gt),
+                "prompt": prompt_text,
+                "response": response_text,
+            }
+
+            # Teacher prompt (only the prompt portion, not the student response appended)
+            if has_teacher:
+                t_prompt_mask = teacher_attention_mask[i, :teacher_prompt_len]
+                t_prompt_ids = teacher_input_ids[i, :teacher_prompt_len][t_prompt_mask.bool()]
+                record["teacher_prompt"] = self.tokenizer.decode(t_prompt_ids, skip_special_tokens=True)
+                if sd_mask is not None:
+                    record["has_privileged_info"] = bool(sd_mask[i].item())
+
+            if has_advantages:
+                record["advantage"] = float(batch.batch["advantages"][i].sum().item())
+
+            records.append(record)
+
+        # Save to JSONL
+        exp_name = self.config.trainer.experiment_name
+        traj_dir = os.path.join(
+            self.config.trainer.default_local_dir, "trajectories"
+        )
+        os.makedirs(traj_dir, exist_ok=True)
+        jsonl_path = os.path.join(traj_dir, f"step_{step}.jsonl")
+        with open(jsonl_path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        # Also log to wandb Table
+        try:
+            import wandb
+            if wandb.run is not None:
+                columns = list(records[0].keys())
+                table = wandb.Table(columns=columns)
+                for r in records:
+                    table.add_data(*[r[c] for c in columns])
+                wandb.log({f"trajectories/step_{step}": table}, step=step)
+        except ImportError:
+            pass
+
     def _compute_or_extract_reward(
         self,
         batch: DataProto,
@@ -912,40 +1015,55 @@ class RayPPOTrainer:
         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
-        # Extract feedback: either from external model (Gemini) or environment
-        use_external = self_distillation_cfg.get("use_external_feedback", False)
-        if use_external:
-            ext_fb_t0 = time.time()
-            feedback_list = self._generate_external_feedback(batch, response_texts, prompt_texts, self_distillation_cfg)
-            ext_fb_time = time.time() - ext_fb_t0
-            # Hard fail if any group didn't get feedback after all retries
-            failed_indices = [i for i, fb in enumerate(feedback_list) if fb is None]
-            if failed_indices:
-                failed_uids = sorted(set(batch.non_tensor_batch["uid"][i] for i in failed_indices))
-                raise RuntimeError(
-                    f"External feedback generation failed for {len(failed_uids)} UID group(s) "
-                    f"after all retries: {failed_uids}"
-                )
-        else:
-            feedback_list = self._collect_feedback(
-                include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-                reward_extra_infos_dict=reward_extra_infos_dict,
-                batch_size=batch_size,
-            )
-            ext_fb_time = None
+        # OPSD mode: use ground-truth reference solution from dataset as teacher's
+        # privileged information, bypassing rollout-based solution gathering.
+        use_dataset_solution = self_distillation_cfg.get("use_dataset_solution", False)
 
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
-        solution_strs = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                batch.non_tensor_batch["uid"],
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
-            )
-            for i in range(batch_size)
-        ]
+        if use_dataset_solution:
+            # Read y* directly from the dataset's reference_solution field
+            solution_strs = [
+                str(batch.non_tensor_batch["reference_solution"][i])
+                for i in range(batch_size)
+            ]
+            feedback_list = [None] * batch_size
+            use_external = False
+            ext_fb_time = None
+        else:
+            # Original SDPO path: extract feedback and solutions from rollouts
+            # Extract feedback: either from external model (Gemini) or environment
+            use_external = self_distillation_cfg.get("use_external_feedback", False)
+            if use_external:
+                ext_fb_t0 = time.time()
+                feedback_list = self._generate_external_feedback(batch, response_texts, prompt_texts, self_distillation_cfg)
+                ext_fb_time = time.time() - ext_fb_t0
+                # Hard fail if any group didn't get feedback after all retries
+                failed_indices = [i for i, fb in enumerate(feedback_list) if fb is None]
+                if failed_indices:
+                    failed_uids = sorted(set(batch.non_tensor_batch["uid"][i] for i in failed_indices))
+                    raise RuntimeError(
+                        f"External feedback generation failed for {len(failed_uids)} UID group(s) "
+                        f"after all retries: {failed_uids}"
+                    )
+            else:
+                feedback_list = self._collect_feedback(
+                    include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+                    reward_extra_infos_dict=reward_extra_infos_dict,
+                    batch_size=batch_size,
+                )
+                ext_fb_time = None
+
+            success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
+            solution_strs = [
+                self._get_solution(
+                    i,
+                    success_by_uid,
+                    batch.non_tensor_batch["uid"],
+                    response_texts,
+                    self_distillation_cfg.dont_reprompt_on_self_success,
+                    self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                )
+                for i in range(batch_size)
+            ]
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
@@ -984,10 +1102,12 @@ class RayPPOTrainer:
 
                 # combine solution and feedback sections
                 if use_feedback or has_solution:
+                    student_response = response_texts[i] if self_distillation_cfg.get("include_student_response_in_reprompt", False) else ""
                     reprompt_text = self_distillation_cfg.reprompt_template.format(
                         prompt=prompt_texts[i],
                         solution=solution_section,
                         feedback=feedback_section,
+                        student_response=student_response,
                     )
                 else:
                     reprompt_text = prompt_texts[i]
@@ -1014,10 +1134,15 @@ class RayPPOTrainer:
         teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
         teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
 
-        # When thinking is enabled, the student prompt has <think> appended after
-        # apply_chat_template (in single_turn_agent_loop). Do the same for the teacher
-        # so the response tokens are contextualised identically.
-        if enable_thinking:
+        # When thinking is enabled AND interruption is enabled, the student prompt
+        # has <think> appended after apply_chat_template (in single_turn_agent_loop).
+        # Do the same for the teacher so the response tokens are contextualised
+        # identically.  When interruption is disabled, the model generates <think>
+        # as the first response token, so we must NOT append it to the teacher
+        # prompt — otherwise the teacher sees a double <think>.
+        interruption_cfg = self.config.actor_rollout_ref.rollout.get("interruption", None)
+        interruption_enabled = getattr(interruption_cfg, "enable", False) if interruption_cfg is not None else False
+        if enable_thinking and interruption_enabled:
             think_token_ids = self.tokenizer.encode("<think>", add_special_tokens=False)
             think_ids = torch.tensor([think_token_ids] * teacher_prompt_ids.shape[0], device=device)
             think_mask = torch.ones_like(think_ids)
@@ -1029,7 +1154,11 @@ class RayPPOTrainer:
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
         # Compute which samples actually use feedback and the distillation mask
-        if use_external:
+        if use_dataset_solution:
+            # OPSD mode: every sample has a dataset reference solution, distill all
+            feedback_used = [False] * batch_size
+            self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+        elif use_external:
             # When using external feedback, mask = feedback received from Gemini
             feedback_used = [feedback_list[i] is not None for i in range(batch_size)]
             self_distillation_mask = torch.tensor(
@@ -1052,8 +1181,13 @@ class RayPPOTrainer:
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
         num_with_solution = sum(1 for s in solution_strs if s is not None)
+        if use_dataset_solution:
+            # In OPSD mode, success_by_uid is not computed
+            success_group_frac = 1.0
+        else:
+            success_group_frac = len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids)
         metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
+            "self_distillation/success_group_fraction": success_group_frac,
             "self_distillation/success_sample_fraction": num_with_solution / batch_size,
             "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
@@ -1092,7 +1226,7 @@ class RayPPOTrainer:
         }), metrics
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt", "reference_solution"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -1107,6 +1241,30 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _generate_with_timeout(self, gen_batch_output):
+        """Run generate_sequences with a configurable timeout to prevent silent hangs.
+
+        Passes _ray_get_timeout to the worker group's Functor, which forwards it
+        to ray.get(timeout=...). On timeout, ray raises GetTimeoutError.
+        """
+        timeout = self.config.trainer.get("generation_timeout", 600)
+        if timeout <= 0:
+            timeout = None  # No timeout
+
+        if not self.async_rollout_mode:
+            try:
+                return self.actor_rollout_wg.generate_sequences(
+                    gen_batch_output, _ray_get_timeout=timeout
+                )
+            except ray.exceptions.GetTimeoutError:
+                raise TimeoutError(
+                    f"generate_sequences timed out after {timeout}s at step {self.global_steps}. "
+                    f"This usually indicates a vLLM rollout server hang during weight update, "
+                    f"resume, or generation. Check worker logs for [rollout_mode] phase timings."
+                )
+        else:
+            return self.async_rollout_manager.generate_sequences(gen_batch_output)
 
     def _validate(self, merged: bool = False):
         data_source_lst = []
@@ -1198,13 +1356,22 @@ class RayPPOTrainer:
 
             reward_extra_infos_dict["reward"].extend(scores)
             reward_extra_info = result.get("reward_extra_info", {})
+            num_samples_so_far = len(sample_scores) - len(scores)  # samples before this batch
             for key, values in reward_extra_info.items():
                 if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
+                    # Back-fill with zeros for samples from previous batches
+                    reward_extra_infos_dict[key] = [0] * num_samples_so_far
                 if isinstance(values, np.ndarray):
                     reward_extra_infos_dict[key].extend(values.tolist())
                 else:
                     reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+            # Pad any keys missing from this batch (present in earlier batches)
+            for key in reward_extra_infos_dict:
+                if key == "reward":
+                    continue
+                shortfall = len(sample_scores) - len(reward_extra_infos_dict[key])
+                if shortfall > 0:
+                    reward_extra_infos_dict[key].extend([0] * shortfall)
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -1953,13 +2120,13 @@ class RayPPOTrainer:
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                _step_t0 = time.monotonic()
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        print(f"[step {self.global_steps}] Starting generate_sequences...", flush=True)
+                        gen_batch_output = self._generate_with_timeout(gen_batch_output)
+                        print(f"[step {self.global_steps}] generate_sequences completed. ({time.monotonic() - _step_t0:.1f}s)", flush=True)
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -2021,6 +2188,7 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    print(f"[step {self.global_steps}] Starting reward computation... ({time.monotonic() - _step_t0:.1f}s)", flush=True)
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -2056,6 +2224,7 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
+                        print(f"[step {self.global_steps}] Starting old_log_prob computation... ({time.monotonic() - _step_t0:.1f}s)", flush=True)
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
@@ -2080,6 +2249,7 @@ class RayPPOTrainer:
 
                                 metrics.update(calculate_debug_metrics(batch))
 
+                    print(f"[step {self.global_steps}] old_log_prob done. ({time.monotonic() - _step_t0:.1f}s)", flush=True)
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
@@ -2094,6 +2264,7 @@ class RayPPOTrainer:
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
+                    print(f"[step {self.global_steps}] Starting adv computation... ({time.monotonic() - _step_t0:.1f}s)", flush=True)
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -2159,6 +2330,7 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        print(f"[step {self.global_steps}] Starting update_actor... ({time.monotonic() - _step_t0:.1f}s)", flush=True)
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -2242,6 +2414,9 @@ class RayPPOTrainer:
 
                 # Log raw traces to wandb for debugging (if configured)
                 self._maybe_log_traces(batch=batch, step=self.global_steps)
+
+                # Log all trajectories if enabled
+                self._log_all_trajectories(batch=batch, step=self.global_steps)
 
                 # Log one sample question/response per step
                 try:

@@ -33,6 +33,8 @@ algorithm:
 
 data:
   train_batch_size: 32
+  val_files:
+    - ${vars.dir}/${vars.task}/test.parquet
 
 trainer:
   val_before_train: True

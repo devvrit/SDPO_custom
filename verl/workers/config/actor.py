@@ -88,6 +88,7 @@ class SelfDistillationConfig(BaseConfig):
         "The following is feedback from your unsuccessful earlier attempt:\n"
         "{feedback_raw}\n\n"
     )
+    include_student_response_in_reprompt: bool = False
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
     use_external_feedback: bool = False
@@ -102,16 +103,24 @@ class SelfDistillationConfig(BaseConfig):
     external_feedback_prompt_template: str = ""  # empty => use DEFAULT_EXTERNAL_FEEDBACK_PROMPT_TEMPLATE
     external_feedback_proxy_teacher_template: str = ""  # empty => use DEFAULT_PROXY_TEACHER_TEMPLATE
     rl_loss_coef: float = 0.0
+    rl_loss_mode: str = "vanilla"  # "vanilla" or "cispo" — algorithm for student RL loss
+    rl_grad_balance: str = "none"  # "log": log separate SDPO/RL grad norms; "none": single combined backward
     teacher_rl_loss_coef: float = 0.0  # Weight for teacher-context RL loss (0 = disabled)
     teacher_rl_is_clip: float = 5.0  # Clip IS weight stopgrad(p_student/p_teacher) for stability
+    teacher_rl_grad_balance: str = "none"  # "clip_sdpo": clip SDPO grads before teacher RL backward; "match": auto-scale teacher RL to match SDPO grad norm; "log": log both grad norms without modifying
     std_normalize_sdpo: bool = False
     std_normalize_eps: float = 1e-8
+    sdpo_advantage_clip: Optional[float] = None  # Clamp |A_sdpo| to this value; None disables
     advantage_sign_masking: bool = False  # Only distill at tokens where sign(advantage) == sign(teacher_logp - student_logp)
+    rl_advantage_sign_masking: bool = False  # Mask RL advantage by sign agreement with teacher-student gap
+    sdpo_loss_coef: float = 1.0  # Weight for SDPO loss (set to 0 for pure masked-RL without SDPO loss)
+    add_forward_kl_coef: float = 0.0  # Adds KL(student || teacher) to SDPO loss; 0 = disabled
+    use_dataset_solution: bool = False  # When True, use dataset's reference_solution field as teacher's privileged info (OPSD mode)
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
-        valid_teacher_regularization = ["ema", "trust-region"]
+        valid_teacher_regularization = ["ema", "trust-region", "none"]
         if self.teacher_regularization not in valid_teacher_regularization:
             raise ValueError(
                 "self_distillation.teacher_regularization must be one of "
@@ -127,6 +136,14 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.sdpo_advantage_clip is not None and self.sdpo_advantage_clip <= 0:
+            raise ValueError(f"self_distillation.sdpo_advantage_clip must be positive, got {self.sdpo_advantage_clip}")
+        valid_grad_balance = ["none", "clip_sdpo", "match", "log"]
+        if self.teacher_rl_grad_balance not in valid_grad_balance:
+            raise ValueError(
+                f"self_distillation.teacher_rl_grad_balance must be one of {valid_grad_balance}, "
+                f"got {self.teacher_rl_grad_balance}"
+            )
         if self.external_feedback_max_retries < 1:
             raise ValueError(
                 f"self_distillation.external_feedback_max_retries must be >= 1, got {self.external_feedback_max_retries}"

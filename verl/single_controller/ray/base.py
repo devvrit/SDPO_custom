@@ -46,12 +46,12 @@ def get_random_string(length: int) -> str:
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
-        def __call__(this, *args, **kwargs):
+        def __call__(this, *args, _ray_get_timeout=None, **kwargs):
             args, kwargs = dispatch_fn(self, *args, **kwargs)
             padding_count = kwargs.pop(_padding_size_key, 0)
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:
-                output = ray.get(output)
+                output = ray.get(output, timeout=_ray_get_timeout)
             output = collect_fn(self, output)
             if padding_count > 0:
                 if isinstance(output, DataProto):

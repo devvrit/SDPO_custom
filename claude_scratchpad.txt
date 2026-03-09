@@ -1,0 +1,163 @@
+./submit.sh -p ml.p5e.48xlarge -c general -s polaris_sdpo_4b -d datasets/polaris_53k -m /fsx/ubuntu/repos/sft_custom/sft_output_easy_saved_ckpts/checkpoint-2750_hf_format  -t 48 trainer.log_trace_interval=15  data.apply_chat_template_kwargs.enable_thinking=true actor_rollout_ref.actor.self_distillation.remove_thinking_from_demonstration=true actor_rollout_ref.rollout.gpu_memory_utilization=0.6  actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.0 actor_rollout_ref.actor.self_distillation.alpha=0.5 trainer.val_before_train=True actor_rollout_ref.rollout.val_kwargs.n=1 actor_rollout_ref.rollout.tensor_model_parallel_size=1
+
+Summary of attempts to fix hanging math verification
+
+  The root cause
+
+  The reward function's math verification (mv_verify, math_equal, mario_is_equiv) hangs indefinitely on
+  certain model-generated expressions. This blocks the training loop since reward computation is
+  sequential (NaiveRewardManager loops over samples one at a time).
+
+  Two independent problems combine:
+  1. mario_is_equiv uses timeout_decorator which calls signal.signal/setitimer, overriding
+     NaiveRewardManager's 30s per-sample SIGALRM handler
+  2. On certain pathological expressions, mario_is_equiv hangs even past its own internal timeouts
+
+  Attempt 1: signal.SIGALRM (already existed in codebase)
+
+  Both naive.py (reward manager, 30s) and math.py (verify, 5s for mv_verify) used signal.SIGALRM.
+
+  Why it caused hangs: math.py's `with timeout(seconds=5):` called signal.alarm(0) on __exit__,
+  CANCELING NaiveRewardManager's 30s alarm. After that, mario_is_equiv's timeout_decorator also
+  overrides the alarm handler. Result: no outer safety net.
+
+  Attempt 2: concurrent.futures.ThreadPoolExecutor for generate_sequences
+
+  Why it didn't help: Hang was in reward computation, not generation.
+
+  Attempt 3: ray.get(timeout=...) for generation
+
+  Why it didn't help: Same — hang was in reward, not generation.
+
+  Attempt 4: multiprocessing.Process (fork) per verification call
+
+  Why it didn't work: Fork copies CUDA context → GPU state corruption.
+
+  Attempt 5: signal.SIGALRM wrapping all three methods with _is_main_thread() check
+
+  Why it didn't work: Detected NOT in main thread, alarm never set.
+
+  Attempt 6: multiprocessing.Pool with spawn context
+
+  Why it didn't work: spawn pool creation hangs on module imports in Ray/CUDA env.
+
+  Attempt 7: threading.Thread with daemon=True for ALL methods + grader.py per-op threads
+
+  Each method in its own daemon thread. grader.py's sympy ops also wrapped in per-op threads.
+
+  Why it broke ACCURACY (not hanging): Wrapping individual sympy operations in threads caused them to
+  silently fail on Python 3.12 (thread-safety issues). Reward scores dropped ~30%:
+  val 0.29→0.19, reward time 10s→1s. Runs 300-301 vs 293-299.
+
+  Attempt 8: Direct calls (no threads) + removed signal timeout class from math.py
+
+  Removed the signal-based timeout class from math.py (which was canceling NaiveRewardManager's alarm).
+  Called all three verification methods directly. math_equal uses multiprocessing (fork) internally
+  which works fine for CPU-only sympy ops. NaiveRewardManager's 30s alarm as outer safety net.
+
+  Result (run 306): Accuracy RESTORED (val ~0.29, reward time ~10-15s). But HUNG at step 195.
+  mario_is_equiv's timeout_decorator overrides NaiveRewardManager's SIGALRM handler (via
+  signal.signal + signal.setitimer calls), so the 30s safety net was gone. mario_is_equiv then hit
+  a pathological expression and hung indefinitely.
+
+  Note: mario_is_equiv's internal 15s timeouts fired on some expressions (57 total across 194 steps,
+  small counts per step). The hang was NOT a timeout loop — it was a single call where even the
+  internal timeout didn't fire (likely a code path after the decorated function returned but before
+  the next one, or a hang in a non-decorated path).
+
+  Attempt 9 (CURRENT): signal patching + thread timeout for mario_is_equiv only
+
+  mv_verify and math_equal: called directly (no wrappers). math_equal's multiprocessing works fine.
+  mario_is_equiv: run in a daemon thread with signal module temporarily patched to no-ops.
+
+  How it works:
+  1. Temporarily patch signal.signal, signal.alarm, signal.setitimer to no-ops
+  2. Start mario_is_equiv in a daemon thread
+  3. thread.join(timeout=15) — hard 15s wall-clock timeout
+  4. Restore signal functions in finally block
+
+  Why signal patching is needed: mario_is_equiv's timeout_decorator calls signal.signal(SIGALRM, ...)
+  at call time. Without patching, this would either:
+  - In main thread: override NaiveRewardManager's alarm handler (bad — removes safety net)
+  - In a thread (no patching): raise ValueError("signal only works in main thread") → always fails
+
+  With patching: timeout_decorator's calls become no-ops, so:
+  - NaiveRewardManager's C-level alarm handler stays registered (safety net intact)
+  - mario_is_equiv's actual math computation runs normally (just without its own internal timeouts)
+  - If it completes: correct result returned
+  - If it hangs: 15s thread timeout catches it
+
+  Why accuracy should be preserved:
+  - mv_verify: direct call, same as old working code
+  - math_equal: direct call with multiprocessing, same as old working code
+  - mario_is_equiv: actual computation identical, just without 15s per-op internal timeouts
+    (our 15s overall thread timeout is equivalent protection)
+
+  Result (run 321): STILL HUNG at step 38. The TypeError from sympy was printed (caught by except),
+  then the process hung for 8+ hours until SLURM killed it. The _run_mario_safely fix was deployed
+  (confirmed from code on disk), so mario_is_equiv should have had a 15s timeout. This means
+  EITHER math_equal hung (direct call, no outer timeout) OR something about _run_mario_safely's
+  thread.join didn't work.
+
+  Attempt 10 (CURRENT): Same as attempt 9 but with timing logs
+
+  Added time.monotonic() logging around each verification method. If it hangs again, logs will
+  show which method was the last to start (the one that hung won't print its elapsed time).
+
+  mv_verify and math_equal remain direct calls (math_equal needs main thread for fork).
+  mario_is_equiv remains in _run_in_thread with signal patching + 15s thread timeout.
+
+  If next run shows math_equal is the one hanging, we'll need to add a thread timeout for it too
+  (accepting the risk that multiprocessing fork from a thread may fail, with the thread timeout
+  as fallback).
+
+  Files changed:
+  - verl/utils/reward_score/feedback/math.py — logging + _run_in_thread for mario
+  - verl/utils/reward_score/prime_math/grader.py — timeout_limit (multiprocessing)
+
+  Attempt 11 (CURRENT): Persistent subprocess for mario_is_equiv
+
+  Previous approaches all failed because they tried to run mario_is_equiv in the same
+  process (threads, signal patching, multiprocessing fork/spawn). The fundamental problem:
+  - timeout_decorator (used by 13+ functions in MARIO_EVAL/math_evaluation/core/latex_parser.py)
+    calls signal.signal(SIGALRM, ...) which overrides NaiveRewardManager's 30s safety alarm
+  - Threads can't use signals → timeout_decorator raises ValueError
+  - Signal patching makes timeout_decorator no-ops → its internal 15s timeouts don't fire
+    (and they're unreliable anyway — mario_is_equiv has been observed taking 150s even with them)
+  - multiprocessing fork copies CUDA context → GPU corruption
+  - multiprocessing spawn hangs on module imports in Ray/CUDA env
+
+  Solution: Run mario_is_equiv in a completely separate Python subprocess via subprocess.Popen.
+
+  How it works:
+  1. A persistent subprocess is spawned on first call (pays ~2-3s sympy import once)
+  2. For each call, we send a JSON line over stdin with {answer, pred, timeout}
+  3. The subprocess runs is_equiv and returns a JSON line over stdout
+  4. We read the response via a daemon reader thread with a wall-clock timeout (35s)
+
+  Three layers of timeout defense inside the subprocess:
+  - timeout_decorator's own 15s per-op timeouts (unreliable but sometimes work)
+  - signal.alarm(30) set before each is_equiv call (best-effort, gets overridden by timeout_decorator)
+  - Reader thread wall-clock timeout (35s) + subprocess kill (GUARANTEED)
+
+  If the subprocess hangs:
+  - Reader thread times out after 35s
+  - We kill() the subprocess and set _mario_proc = None
+  - Next call spawns a fresh subprocess (~2-3s one-time cost)
+  - The killed subprocess cannot affect the parent's SIGALRM in any way
+
+  Why this solves the problem:
+  - Subprocess has its OWN signal space — cannot interfere with NaiveRewardManager's SIGALRM
+  - Subprocess has NO CUDA context (CUDA_VISIBLE_DEVICES="" in env)
+  - Subprocess IS the main thread so timeout_decorator doesn't raise ValueError
+  - subprocess.kill() is an OS-level SIGKILL — guaranteed to terminate, unlike threads
+
+  Performance:
+  - Persistent process stays alive across all samples in a batch (and across batches)
+  - Each call is just JSON over stdin/stdout — negligible overhead
+  - Only pays respawn cost (~2-3s) when a call actually hangs and we have to kill
+  - mv_verify and math_equal remain direct calls in main process (unchanged)
+
+  Files changed:
+  - verl/utils/reward_score/feedback/math.py — replaced _run_in_thread with persistent subprocess
+    (_MARIO_WORKER_SCRIPT, _get_mario_proc, _kill_mario_proc, _run_mario_is_equiv_subprocess)

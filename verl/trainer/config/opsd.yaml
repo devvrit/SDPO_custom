@@ -1,0 +1,57 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# OPSD: On-Policy Self-Distillation (arXiv:2601.18734)
+# Prompt 2048 + Response 2048 + teacher reprompt headroom
+max_model_len: 6144
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: sdpo
+    self_distillation:
+      max_reprompt_len: 4096
+      is_clip: null
+      alpha: 0.5
+      distillation_topk: null
+      use_dataset_solution: true
+      include_environment_feedback: false
+      dont_reprompt_on_self_success: false
+      teacher_update_rate: 0.0
+      teacher_rl_loss_coef: 0.0
+      rl_loss_coef: 0.0
+      # OPSD teacher prompt (paper Figure 2): teacher sees y* as privileged info
+      solution_template: "\n\nHere is a reference solution:\n{successful_previous_attempt}\n\nAfter understanding the reference solution, please try to solve this problem using your own approach below:\n"
+      reprompt_template: "{prompt}{solution}{feedback}\nNow solve this problem step by step and output the final answer within \\boxed{{}}.\n"
+    optim:
+      lr: 2e-5
+  rollout:
+    n: 1
+    calculate_log_probs: True
+    max_model_len: 6144
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: True
+  use_kl_in_reward: False
+  rollout_correction:
+    rollout_is: null
+
+data:
+  train_batch_size: 32
+  max_response_length: 2048
+  max_prompt_length: 2048
+  val_files:
+    - ${vars.dir}/datasets/eval_benchmarks/aime_2024.parquet
+    - ${vars.dir}/datasets/eval_benchmarks/aime_2025.parquet
+    - ${vars.dir}/datasets/eval_benchmarks/hmmt_feb_2025.parquet
+    - ${vars.dir}/datasets/eval_benchmarks/amo_bench.parquet
+
+trainer:
+  val_before_train: False
+  test_freq: 50
+  max_actor_ckpt_to_keep: null
+  total_epochs: 1

@@ -79,7 +79,7 @@ trainer.n_gpus_per_node=8 \
 actor_rollout_ref.rollout.n=$ROLLOUT_BATCH_SIZE \
 actor_rollout_ref.model.path=$MODEL_PATH \
 actor_rollout_ref.actor.optim.lr=$LR \
-actor_rollout_ref.actor.ppo_mini_batch_size=1 \
+actor_rollout_ref.actor.ppo_mini_batch_size=32 \
 actor_rollout_ref.actor.self_distillation.distillation_topk=20 \
 algorithm.rollout_correction.rollout_is=token \
 actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONTS_REPROMPT_ON_SELF_SUCCESS} \
@@ -93,7 +93,8 @@ vars.log_dir=$LOG_DIR \
 vars.ckpt_dir=$CKPT_DIR \
 vars.task=$DATA_PATH \
 custom_reward_function.path=$CUSTOM_REWARD_PATH \
-actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
+trainer.total_epochs=90"
 
 
 echo "----------------------------------------------------------------"
@@ -112,4 +113,5 @@ if [ -n "$EXTRA_HYDRA_ARGS" ]; then
     echo "Extra Hydra args: $EXTRA_HYDRA_ARGS"
 fi
 
-bash "$PROJECT_ROOT/training/verl_training.sh" "$EXP_NAME" "$CONFIG_NAME" "$DATA_PATH" $FINAL_ARGS
+bash "$PROJECT_ROOT/training/verl_training.sh" "$EXP_NAME" "$CONFIG_NAME" "$DATA_PATH" $FINAL_ARGS \
+    $'actor_rollout_ref.actor.self_distillation.reprompt_template="{prompt}{solution}{feedback}\n\nCorrectly solve the original question."'

@@ -1,11 +1,14 @@
 #!/bin/bash
 
-# Usage: ./run_scripts/lcb_rl_coef.sh [experiment_name_suffix]
+# Usage: ./run_scripts/lcb_cotrain_rev_norm_rl_coef.sh [experiment_name_suffix]
 # Note: Offloading is NOT set here — it is injected by submit.sh based on partition.
 # Note: MODEL_PATH and DATA_PATH can be set via environment (from submit.sh).
 #
-# Like lcb.sh but adds RL loss (rl_loss_coef=1.0) with grpo_hybrid advantages
-# and std-normalized SDPO loss (std_normalize_sdpo=true).
+# Like lcb_cotrain_rev_norm.sh but adds GRPO advantages and rl_loss_coef=1.0:
+# - teacher_rl_loss_coef: teacher-context RL loss with IS correction
+# - rl_loss_coef: standard RL loss on rollout advantages
+# - std_normalize_sdpo: std-normalized SDPO advantage
+# - algorithm.adv_estimator=grpo: GRPO advantage estimator
 
 # =============================================================================
 # CONFIGURATION
@@ -25,6 +28,13 @@ DONTS_REPROMPT_ON_SELF_SUCCESS=True
 ALPHA=1.0
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
 export N_GPUS_PER_NODE=8
+
+# Teacher RL loss settings
+TEACHER_RL_LOSS_COEF=1.0
+TEACHER_UPDATE_RATE=0.01  # EMA teacher for stable SDPO target
+
+# RL loss coef
+RL_LOSS_COEF=1.0
 
 # =============================================================================
 # SETUP
@@ -79,7 +89,8 @@ actor_rollout_ref.actor.self_distillation.distillation_topk=20 \
 algorithm.rollout_correction.rollout_is=token \
 actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONTS_REPROMPT_ON_SELF_SUCCESS} \
 actor_rollout_ref.actor.self_distillation.alpha=$ALPHA \
-actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.01 \
+actor_rollout_ref.actor.self_distillation.teacher_rl_loss_coef=$TEACHER_RL_LOSS_COEF \
+actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE \
 actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
 actor_rollout_ref.rollout.val_kwargs.n=4 \
 vars.dir=$BASE_DIR \
@@ -89,15 +100,19 @@ vars.task=$DATA_PATH \
 custom_reward_function.path=$CUSTOM_REWARD_PATH \
 actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 algorithm.adv_estimator=grpo \
-actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
+actor_rollout_ref.actor.self_distillation.rl_loss_coef=$RL_LOSS_COEF \
 actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=true \
 trainer.total_epochs=90"
 
+
 echo "----------------------------------------------------------------"
-echo "Starting LCB SDPO + RL Training"
+echo "Starting SDPO + Teacher RL + RL Co-Training (LCB)"
 echo "Experiment: $EXP_NAME"
 echo "Data: $DATA_PATH"
 echo "Model: $MODEL_PATH"
+echo "Teacher RL coef: $TEACHER_RL_LOSS_COEF"
+echo "Teacher update rate: $TEACHER_UPDATE_RATE"
+echo "RL loss coef: $RL_LOSS_COEF"
 echo "----------------------------------------------------------------"
 
 # Append extra Hydra args if provided (e.g. offloading injected by submit.sh)

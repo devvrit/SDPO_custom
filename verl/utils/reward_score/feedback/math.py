@@ -13,14 +13,145 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
+import json
+import os
 import re
-import signal
+import subprocess
+import sys
+import threading
+import time
 from typing import Optional
 from math_verify import parse as mv_parse, verify as mv_verify
 from verl.utils.reward_score.prime_math.grader import math_equal
-from math_evaluation import is_equiv as mario_is_equiv
 
 FORMAT_PENALTY = False
+
+# ---------------------------------------------------------------------------
+# Persistent subprocess for mario_is_equiv
+# ---------------------------------------------------------------------------
+# We run mario_is_equiv in a long-lived subprocess to avoid:
+# 1. timeout_decorator overriding NaiveRewardManager's SIGALRM handler
+# 2. CUDA context corruption from fork
+# 3. Signal errors from threading
+#
+# The subprocess has its own signal space, so timeout_decorator works normally.
+# Import cost (~2s for sympy) is paid once at first call, then each request
+# is just JSON over stdin/stdout.
+# ---------------------------------------------------------------------------
+
+_MARIO_PER_CALL_TIMEOUT = 30  # seconds per is_equiv call
+
+# The worker script for the persistent subprocess.
+# Reads JSON lines from stdin, writes JSON lines to stdout.
+# Each call has its own SIGALRM-based timeout as a safety net.
+_MARIO_WORKER_SCRIPT = r'''
+import json
+import signal
+import sys
+
+# Silence stderr from sympy/timeout_decorator noise
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+from math_evaluation import is_equiv
+
+def _alarm_handler(signum, frame):
+    raise TimeoutError("mario_is_equiv overall timeout")
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+        timeout = d.get("timeout", 30)
+        # Set a hard per-call alarm as safety net
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(timeout)
+        try:
+            result = bool(is_equiv(d["answer"], d["pred"]))
+        except TimeoutError:
+            result = False
+        except Exception:
+            result = False
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+        print(json.dumps({"ok": True, "result": result}), flush=True)
+    except Exception as e:
+        print(json.dumps({"ok": False, "result": False}), flush=True)
+'''
+
+_mario_proc = None
+_mario_lock = threading.Lock()
+
+
+def _get_mario_proc():
+    """Get or start the persistent mario_is_equiv subprocess."""
+    global _mario_proc
+    if _mario_proc is not None and _mario_proc.poll() is None:
+        return _mario_proc
+    # Start a new subprocess
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+    _mario_proc = subprocess.Popen(
+        [sys.executable, "-c", _MARIO_WORKER_SCRIPT],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=env,
+    )
+    return _mario_proc
+
+
+def _kill_mario_proc():
+    """Kill the persistent subprocess (e.g. after a hung call)."""
+    global _mario_proc
+    if _mario_proc is not None:
+        try:
+            _mario_proc.kill()
+            _mario_proc.wait(timeout=2)
+        except Exception:
+            pass
+        _mario_proc = None
+
+
+def _run_mario_is_equiv_subprocess(answer: str, pred: str) -> bool:
+    """Call mario_is_equiv via the persistent subprocess."""
+    with _mario_lock:
+        try:
+            proc = _get_mario_proc()
+            payload = json.dumps({
+                "answer": answer,
+                "pred": pred,
+                "timeout": _MARIO_PER_CALL_TIMEOUT,
+            }) + "\n"
+            proc.stdin.write(payload)
+            proc.stdin.flush()
+
+            # Read response with a wall-clock timeout via a thread
+            response = [None]
+            def _read():
+                try:
+                    response[0] = proc.stdout.readline()
+                except Exception:
+                    pass
+
+            reader = threading.Thread(target=_read, daemon=True)
+            reader.start()
+            reader.join(timeout=_MARIO_PER_CALL_TIMEOUT + 5)
+
+            if reader.is_alive() or not response[0]:
+                # Subprocess hung — kill it so next call starts a fresh one
+                print(f"[verify] mario_is_equiv subprocess hung, killing", flush=True)
+                _kill_mario_proc()
+                return False
+
+            data = json.loads(response[0])
+            return bool(data.get("result", False))
+        except Exception:
+            _kill_mario_proc()
+            return False
 
 
 def last_boxed_only_string(string: str) -> Optional[str]:
@@ -71,22 +202,6 @@ def remove_boxed(s: str) -> str:
         return ""
 
 
-class timeout:
-    def __init__(self, seconds=1, error_message="Timeout"):
-        self.seconds = seconds
-        self.error_message = error_message
-
-    def handle_timeout(self, signum, frame):
-        raise TimeoutError(self.error_message)
-
-    def __enter__(self):
-        signal.signal(signal.SIGALRM, self.handle_timeout)
-        signal.alarm(self.seconds)
-
-    def __exit__(self, type, value, traceback):
-        signal.alarm(0)
-
-
 def is_correct_strict_box(
     pred: str, gt: str, pause_tokens_index: Optional[list[int]] = None
 ) -> tuple[int, Optional[str]]:
@@ -112,42 +227,58 @@ def verify(
 ) -> bool:
     """Verify if the solution is correct.
 
-    Args:
-        solution_str: The solution string to verify
-        answer: The ground truth answer
-        strict_box_verify: Whether to use strict box verification
-        pause_tokens_index: Indices of pause tokens
+    mv_verify and math_equal are called directly in the main thread.
+    math_equal uses multiprocessing (fork) internally which needs the main thread.
+
+    mario_is_equiv runs in a daemon thread with signal module patched, because
+    its timeout_decorator overrides the process-level SIGALRM handler.
 
     Returns:
-        True if the solution is correct, False otherwise
+        Tuple of (correct, extracted_prediction)
     """
     correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
     if pred is None:
         pred = ""
 
-    # try Math-Verify equivalence check
-    if not correct and pred != "":
-        try:
-            with timeout(seconds=5):
-                gold_expr = mv_parse(answer)
-                pred_expr = mv_parse(pred)
-                correct = mv_verify(gold_expr, pred_expr)
-        except Exception:  # ignore any parsing/verification errors
-            pass
+    if correct or pred == "":
+        return correct, pred
 
-    # try sympy-based symbolic equivalence check (handles latex, numerical tolerance, etc.)
-    if not correct and pred != "":
+    # try Math-Verify equivalence check (direct call, fast)
+    if not correct:
+        t0 = time.monotonic()
+        try:
+            gold_expr = mv_parse(answer)
+            pred_expr = mv_parse(pred)
+            correct = mv_verify(gold_expr, pred_expr)
+        except Exception:
+            pass
+        elapsed = time.monotonic() - t0
+        if elapsed > 3:
+            print(f"[verify] mv_verify took {elapsed:.1f}s (pred={pred[:60]!r})", flush=True)
+
+    # try sympy-based math_equal (direct call, has internal multiprocessing timeout)
+    if not correct:
+        t0 = time.monotonic()
         try:
             correct = math_equal(pred, answer, timeout=10.0)
         except Exception:
             pass
+        elapsed = time.monotonic() - t0
+        if elapsed > 15:
+            print(f"[verify] math_equal took {elapsed:.1f}s (pred={pred[:60]!r})", flush=True)
 
-    # try MARIO_EVAL (robust LaTeX equivalence via latex2sympy + normalization)
-    if not correct and pred != "":
+    # mario_is_equiv via subprocess — completely isolated process with its own
+    # signal space, so timeout_decorator works normally and can't interfere
+    # with NaiveRewardManager's SIGALRM.
+    if not correct:
+        t0 = time.monotonic()
         try:
-            correct = mario_is_equiv(answer, pred)
+            correct = _run_mario_is_equiv_subprocess(answer, pred)
         except Exception:
             pass
+        elapsed = time.monotonic() - t0
+        if elapsed > 10:
+            print(f"[verify] mario_is_equiv subprocess took {elapsed:.1f}s (pred={pred[:60]!r})", flush=True)
 
     return correct, pred
 

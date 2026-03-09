@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -1322,34 +1323,54 @@ def compute_self_distillation_loss(
         per_token_loss = kl_loss.sum(-1)
         if getattr(self_distillation_config, "std_normalize_sdpo", False):
             sdpo_norm_eps = getattr(self_distillation_config, "std_normalize_eps", 1e-8)
+            sdpo_adv_clip = getattr(self_distillation_config, "sdpo_advantage_clip", None)
 
-            # Compute log_ratio and p_weight (all detached — only student_distill_log_probs has gradient)
+            # Compute log_ratio and log_p (all detached — only student_distill_log_probs has gradient)
             if self_distillation_config.alpha == 1.0:
                 log_ratio = -(student_distill_log_probs - teacher_distill_log_probs).detach()
-                p_weight = student_distill_log_probs.exp().detach()
+                log_p = student_distill_log_probs.detach()
             elif self_distillation_config.alpha == 0.0:
                 log_ratio = -(teacher_distill_log_probs - student_distill_log_probs).detach()
-                p_weight = teacher_distill_log_probs.exp().detach()
+                log_p = teacher_distill_log_probs.detach()
             else:
                 log_ratio = -(student_distill_log_probs - mixture_log_probs).detach()
-                p_weight = mixture_log_probs.exp().detach()
+                log_p = mixture_log_probs.detach()
+
+            # p_weight in linear space — needed for mu/var computation.
+            # Underflow of tiny-probability tokens to zero is correct here
+            # (they should contribute ~0 to the expectation).
+            p_weight = log_p.exp()                                                # (bs, seq_len, topk)
 
             # Per-position p-weighted mean and variance of log_ratio
-            mu = (p_weight * log_ratio).sum(-1, keepdim=True)                    # (bs, seq_len, 1)
-            var = (p_weight * (log_ratio - mu).pow(2)).sum(-1, keepdim=True)      # (bs, seq_len, 1)
-            sigma = var.sqrt().clamp(min=sdpo_norm_eps)                           # (bs, seq_len, 1)
+            mu = (p_weight * log_ratio).sum(-1, keepdim=True)                     # (bs, seq_len, 1)
+            var = (p_weight * (log_ratio - mu).pow(2)).sum(-1, keepdim=True)       # (bs, seq_len, 1)
+            sigma = var.sqrt().clamp(min=sdpo_norm_eps)                            # (bs, seq_len, 1)
 
-            # Normalized advantage (all detached)
-            # Zero out positions where sigma is degenerate (top-k log_ratios nearly identical,
-            # no meaningful distributional signal for the gradient).
-            degenerate = (var.sqrt() < 1e-3)  # (bs, seq_len, 1)
-            A_sdpo = torch.where(degenerate, torch.zeros_like(log_ratio), (log_ratio - mu) / sigma)  # (bs, seq_len, topk)
+            # --- Log-space computation of pA = p * A_sdpo (all detached) ---
+            # Avoids exp(log_p) underflow for the per-element product.
+            centered = log_ratio - mu                                              # (bs, seq_len, topk)
+            sign_centered = centered.sign()
+            log_abs_centered = centered.abs().clamp(min=1e-20).log()               # clamp avoids log(0)
 
-            # Loss: p * A * log_p_student (only student_distill_log_probs has gradient)
-            per_token_loss = -(p_weight * A_sdpo * student_distill_log_probs).sum(-1)  # (bs, seq_len)
+            # A_sdpo = centered / sigma  →  log|A| = log|centered| - log(sigma)
+            log_abs_A = log_abs_centered - sigma.log()                             # (bs, seq_len, topk)
+
+            # Optional clipping: |A_sdpo| <= clip  →  log|A| <= log(clip)
+            if sdpo_adv_clip is not None:
+                log_abs_A = log_abs_A.clamp(max=math.log(sdpo_adv_clip))
+
+            # pA = exp(log_p + log|A|) * sign  (single exp, no intermediate underflow)
+            log_pA = log_p + log_abs_A                                             # (bs, seq_len, topk)
+            pA = log_pA.exp() * sign_centered                                     # (bs, seq_len, topk)
+
+            # Loss: -pA * log_p_student  (only student_distill_log_probs carries gradient)
+            per_token_loss = -(pA * student_distill_log_probs).sum(-1)             # (bs, seq_len)
 
             # Log metrics + debug prints
             with torch.no_grad():
+                # Reconstruct A_sdpo for metrics only
+                A_sdpo = log_abs_A.exp() * sign_centered                           # (bs, seq_len, topk)
+
                 mask_3d = loss_mask.unsqueeze(-1).expand_as(A_sdpo)
                 valid_A = A_sdpo[mask_3d.bool()]
                 valid_mu = mu.squeeze(-1)[loss_mask.bool()]
@@ -1361,20 +1382,22 @@ def compute_self_distillation_loss(
                 metrics["self_distillation/sdpo_sigma_mean"] = valid_sigma.mean().item() if _has_valid else float('nan')
                 metrics["self_distillation/sdpo_sigma_min"] = valid_sigma.min().item() if _has_valid else float('nan')
 
-                # Log degenerate position stats
-                if _has_valid:
-                    degen_2d = degenerate.squeeze(-1) & loss_mask.bool()  # (bs, seq_len)
-                    n_valid = loss_mask.bool().sum().item()
-                    n_degen = degen_2d.sum().item()
-                    degen_frac = n_degen / max(n_valid, 1)
-                    degen_mu_mean = mu.squeeze(-1)[degen_2d].mean().item() if degen_2d.any() else 0.0
-                else:
-                    n_valid = 0
-                    n_degen = 0
-                    degen_frac = float('nan')
-                    degen_mu_mean = float('nan')
-                metrics["self_distillation/sdpo_degenerate_fraction"] = degen_frac
-                metrics["self_distillation/sdpo_degenerate_mu_mean"] = degen_mu_mean
+                # Log pA stats (computed in log space)
+                valid_pA = pA[mask_3d.bool()]
+                metrics["self_distillation/pweight_A_sdpo_mean"] = valid_pA.mean().item() if _has_valid else float('nan')
+                metrics["self_distillation/pweight_A_sdpo_min"] = valid_pA.min().item() if _has_valid else float('nan')
+                metrics["self_distillation/pweight_A_sdpo_max"] = valid_pA.max().item() if _has_valid else float('nan')
+
+                # Log clipping stats
+                if sdpo_adv_clip is not None:
+                    nonzero_sign = (sign_centered != 0) & mask_3d.bool()
+                    if nonzero_sign.any():
+                        unclipped_log_abs_A = log_abs_centered - sigma.log()
+                        clip_active = (unclipped_log_abs_A[nonzero_sign] > math.log(sdpo_adv_clip))
+                        clip_frac = clip_active.float().mean().item()
+                    else:
+                        clip_frac = float('nan')
+                    metrics["self_distillation/sdpo_advantage_clip_fraction"] = clip_frac
 
                 import os
                 if os.environ.get("RANK", "0") == "0" and _has_valid:
@@ -1385,7 +1408,9 @@ def compute_self_distillation_loss(
                     print(f"  mu (per-pos KL): min={valid_mu.min():.6f} max={valid_mu.max():.6f} mean={valid_mu.mean():.6f}")
                     print(f"  sigma: min={valid_sigma.min():.6f} max={valid_sigma.max():.6f} mean={valid_sigma.mean():.6f}")
                     print(f"  A_sdpo: min={valid_A.min():.4f} max={valid_A.max():.4f} abs_mean={valid_A.abs().mean():.4f}")
-                    print(f"  degenerate: {n_degen}/{int(n_valid)} ({degen_frac:.4f}), mu_mean={degen_mu_mean:.6f}")
+                    print(f"  pA (log-space): min={valid_pA.min():.6f} max={valid_pA.max():.6f} mean={valid_pA.mean():.6f}")
+                    if sdpo_adv_clip is not None:
+                        print(f"  adv_clip={sdpo_adv_clip}, clip_fraction={clip_frac:.4f}")
                     print(f"  per_token_loss: min={valid_loss.min():.6f} max={valid_loss.max():.6f} mean={valid_loss.mean():.6f}")
                     print(f"  old KL (comparison): min={old_kl.min():.6f} max={old_kl.max():.6f} mean={old_kl.mean():.6f}\n")
     else:

@@ -1,0 +1,17 @@
+defaults:
+  - sdpo
+  - _self_
+
+# SDPO with thinking mode and minimal (domain-agnostic) templates
+
+actor_rollout_ref:
+  actor:
+    self_distillation:
+      reprompt_template: "{prompt}{solution}{feedback}"
+      solution_template: "\n\n{successful_previous_attempt}\n\n"
+      feedback_template: "\n\n{feedback_raw}\n\n"
+
+data:
+  val_files:
+    - ${vars.dir}/${vars.task}/test.parquet
+    - ${vars.dir}/datasets/eval_benchmarks/aime_2025_tooluse.parquet

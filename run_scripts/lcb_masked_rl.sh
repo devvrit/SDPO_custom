@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Usage: ./run_scripts/lcb_rl_coef.sh [experiment_name_suffix]
+# Usage: ./run_scripts/lcb_masked_rl.sh [experiment_name_suffix]
 # Note: Offloading is NOT set here — it is injected by submit.sh based on partition.
 # Note: MODEL_PATH and DATA_PATH can be set via environment (from submit.sh).
 #
-# Like lcb.sh but adds RL loss (rl_loss_coef=1.0) with grpo_hybrid advantages
-# and std-normalized SDPO loss (std_normalize_sdpo=true).
+# Pure masked RL: RL loss only (sdpo_loss_coef=0), with advantages masked by
+# sign agreement with teacher-student log prob gap (rl_advantage_sign_masking=true).
 
 # =============================================================================
 # CONFIGURATION
@@ -62,7 +62,7 @@ elif [ -n "$JOB_NAME" ]; then
     EXP_NAME="$JOB_NAME"
 else
     MODEL_NAME=$(echo "$MODEL_PATH" | tr '/' '-')
-    EXP_NAME="LOCAL-SDPO-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-lambda${LAMBDA}-clip_adv_high${CLIP_ADV_HIGH}-dross${DONTS_REPROMPT_ON_SELF_SUCCESS}-${MODEL_NAME}-${SUFFIX}"
+    EXP_NAME="LOCAL-MASKED-RL-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-${MODEL_NAME}-${SUFFIX}"
 fi
 
 ARGS="data.train_batch_size=$TRAIN_BATCH_SIZE \
@@ -90,11 +90,13 @@ custom_reward_function.path=$CUSTOM_REWARD_PATH \
 actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 algorithm.adv_estimator=grpo \
 actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
+actor_rollout_ref.actor.self_distillation.sdpo_loss_coef=0.0 \
+actor_rollout_ref.actor.self_distillation.rl_advantage_sign_masking=true \
 actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=true \
 trainer.total_epochs=90"
 
 echo "----------------------------------------------------------------"
-echo "Starting LCB SDPO + RL Training"
+echo "Starting LCB Masked RL Training"
 echo "Experiment: $EXP_NAME"
 echo "Data: $DATA_PATH"
 echo "Model: $MODEL_PATH"

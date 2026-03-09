@@ -98,7 +98,7 @@ self_distillation:
   # Minimum sequence reward to be considered successful
   success_reward_threshold: 0.5
 
-  # Teacher regularization method: "ema" or "trust-region"
+  # Teacher regularization method: "ema", "trust-region", or "none" (live teacher, no separate copy)
   teacher_regularization: ema
 
   # EMA update rate for teacher weights, or trust-region mixing coefficient
@@ -164,6 +164,12 @@ self_distillation:
   # Weight for RL policy gradient loss combined with SDPO: L = L_sdpo + rl_loss_coef * L_RL
   rl_loss_coef: 0.0
 
+  # Algorithm for student RL loss: "vanilla" (standard PPO) or "cispo"
+  rl_loss_mode: vanilla
+
+  # Grad balancing for student RL: "none" (single backward) or "log" (separate backwards, log grad norms)
+  rl_grad_balance: "none"
+
   # Weight for teacher-context RL loss (0 = disabled). Uses actor_module on
   # reprompted teacher inputs with IS correction stopgrad(p_student/p_teacher).
   teacher_rl_loss_coef: 0.0
@@ -171,20 +177,40 @@ self_distillation:
   # Clip IS weight for teacher RL loss stability
   teacher_rl_is_clip: 5.0
 
+  # Grad balancing for teacher RL: "none", "clip_sdpo", "match", or "log" (log both norms, no modification)
+  teacher_rl_grad_balance: "none"
+
   # Whether to normalize per-token SDPO losses by std before aggregation
   std_normalize_sdpo: false
 
   # Only distill at tokens where sign(advantage) == sign(teacher_logp - student_logp)
   advantage_sign_masking: false
 
+  # Mask RL advantage to only apply at tokens where sign(advantage) == sign(teacher_logp - student_logp)
+  rl_advantage_sign_masking: false
+
+  # Weight for SDPO loss in combined loss. Set to 0 for pure masked-RL (no SDPO loss component)
+  sdpo_loss_coef: 1.0
+
+  # Adds KL(teacher_ctx || student_ctx) to the teacher RL loss; 0 = disabled
+  add_forward_kl_coef: 0.0
+
   # Epsilon for std normalization
   std_normalize_eps: 1.0e-8
 
+  # Clamp |A_sdpo| to this value; null disables clipping
+  sdpo_advantage_clip: null
+
+  # When true, use the dataset's reference_solution field as the teacher's
+  # privileged information (OPSD mode) instead of successful rollouts.
+  use_dataset_solution: false
+
   # Prompt templates - canonical source of truth is verl/workers/config/actor.py
   # These must be present for Hydra struct mode. Keep in sync with actor.py.
-  reprompt_template: "{prompt}{solution}{feedback}\n\nNow solve the original problem in a fresh way. Do not mention or refer to the critique or the revision process. Use the feedback/critique only to improve correctness, clarity, and reasoning. Avoid using phrases like \"Correctly applying the critique...\" or \"Reexamining my earlier solution...\", \"Given correct answer:..\" etc., as the final answer should stand alone. Basically, reading your thought process and summarized solution, it should not be apparent that you had access to privileged information, though you can use and refer the privileged information to help guide your attempt. Also, during generation, if you get interrupted due to limited time to think, just produce a summarized answer based on your thinking so far, without going in a loop to think much more. Now let's think step by step and output the final answer within \\boxed{{}}.\n"
+  reprompt_template: "{prompt}{solution}{feedback}\n\nNow solve the original problem in a fresh way. Do not mention or refer to the critique or the revision process. Use the feedback/critique only to improve correctness, clarity, and reasoning. Avoid using phrases like \"Correctly applying the critique...\" or \"Reexamining my earlier solution...\", \"Given correct answer:..\", \"They gave reference solution/feecback:..\" etc., as the final answer should stand alone. Basically, reading your thought process and summarized solution, it should not be apparent that you had access to privileged information, though you can use and refer the privileged information to help guide your attempt. Now let's think step by step and output the final answer within \\boxed{{}}.\n"
   solution_template: "\n\nHere's a reference correct solution to help you approach the above problem:\n\n{successful_previous_attempt}\n\n"
   feedback_template: "\n\nThe following is feedback from your unsuccessful earlier attempt:\n{feedback_raw}\n\n"
+  include_student_response_in_reprompt: false
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

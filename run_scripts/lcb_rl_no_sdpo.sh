@@ -1,11 +1,10 @@
 #!/bin/bash
 
-# Usage: ./run_scripts/lcb_rl_coef.sh [experiment_name_suffix]
+# Usage: ./run_scripts/lcb_rl_no_sdpo.sh [experiment_name_suffix]
 # Note: Offloading is NOT set here — it is injected by submit.sh based on partition.
 # Note: MODEL_PATH and DATA_PATH can be set via environment (from submit.sh).
 #
-# Like lcb.sh but adds RL loss (rl_loss_coef=1.0) with grpo_hybrid advantages
-# and std-normalized SDPO loss (std_normalize_sdpo=true).
+# Like lcb_rl_coef.sh but with sdpo_loss_coef=0.0 (pure RL, no SDPO distillation loss).
 
 # =============================================================================
 # CONFIGURATION
@@ -90,11 +89,12 @@ custom_reward_function.path=$CUSTOM_REWARD_PATH \
 actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 algorithm.adv_estimator=grpo \
 actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
+actor_rollout_ref.actor.self_distillation.sdpo_loss_coef=0.0 \
 actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=true \
 trainer.total_epochs=90"
 
 echo "----------------------------------------------------------------"
-echo "Starting LCB SDPO + RL Training"
+echo "Starting LCB Pure RL Training (no SDPO loss)"
 echo "Experiment: $EXP_NAME"
 echo "Data: $DATA_PATH"
 echo "Model: $MODEL_PATH"

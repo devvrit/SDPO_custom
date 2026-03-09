@@ -49,9 +49,7 @@ DEFAULT_PROXY_TEACHER_TEMPLATE = (
     "Use the feedback/critique only to improve correctness, clarity, and reasoning. Avoid using phrases "
     "like \"Correctly applying the critique...\" or \"Using the feedback...\", \"Given the hint:..\" etc., "
     "as your solution should stand alone. Basically, reading your thought process and summarized solution, "
-    "it should not be apparent that you had access to any privileged information. Also, during generation, "
-    "if you get interrupted due to limited time to think, just produce a summarized answer based on your "
-    "thinking so far, without going in a loop to think much more."
+    "it should not be apparent that you had access to any privileged information. "
     "Now think step by step and write your answer in \\boxed{{}} format. "
 )
 
@@ -136,14 +134,17 @@ async def get_external_feedback(
     last_error = None
     for attempt in range(max_retries):
         try:
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    ),
                 ),
+                timeout=300,  # 5 minute timeout per API call
             )
             return response.text
         except Exception as e:

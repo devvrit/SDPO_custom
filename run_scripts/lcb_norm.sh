@@ -17,7 +17,7 @@ DATA_PATH="${DATA_PATH:-datasets/lcb_v6}"
 # Hyperparameters
 TRAIN_BATCH_SIZE=32
 ROLLOUT_BATCH_SIZE=8
-LR=4e-6
+LR=1e-6
 LAMBDA=0.0
 CLIP_ADV_HIGH=null
 DONTS_REPROMPT_ON_SELF_SUCCESS=True
@@ -73,7 +73,7 @@ trainer.n_gpus_per_node=8 \
 actor_rollout_ref.rollout.n=$ROLLOUT_BATCH_SIZE \
 actor_rollout_ref.model.path=$MODEL_PATH \
 actor_rollout_ref.actor.optim.lr=$LR \
-actor_rollout_ref.actor.ppo_mini_batch_size=1 \
+actor_rollout_ref.actor.ppo_mini_batch_size=32 \
 actor_rollout_ref.actor.self_distillation.distillation_topk=20 \
 algorithm.rollout_correction.rollout_is=token \
 actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONTS_REPROMPT_ON_SELF_SUCCESS} \
@@ -89,7 +89,8 @@ custom_reward_function.path=$CUSTOM_REWARD_PATH \
 actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 algorithm.adv_estimator=grpo \
 actor_rollout_ref.actor.self_distillation.rl_loss_coef=0.0 \
-actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=true"
+actor_rollactor_rollout_refout_ref.actor.self_distillation.std_normalize_sdpo=true \
+trainer.total_epochs=90"
 
 echo "----------------------------------------------------------------"
 echo "Starting LCB SDPO (normalized, no RL) Training"
@@ -105,4 +106,5 @@ if [ -n "$EXTRA_HYDRA_ARGS" ]; then
     echo "Extra Hydra args: $EXTRA_HYDRA_ARGS"
 fi
 
-bash "$PROJECT_ROOT/training/verl_training.sh" "$EXP_NAME" "$CONFIG_NAME" "$DATA_PATH" $FINAL_ARGS
+bash "$PROJECT_ROOT/training/verl_training.sh" "$EXP_NAME" "$CONFIG_NAME" "$DATA_PATH" $FINAL_ARGS \
+    $'actor_rollout_ref.actor.self_distillation.reprompt_template="{prompt}{solution}{feedback}\n\nCorrectly solve the original question."'

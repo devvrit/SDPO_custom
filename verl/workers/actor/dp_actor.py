@@ -18,6 +18,7 @@ Single Process Actor
 """
 
 import logging
+import math
 import os
 import time
 
@@ -600,6 +601,25 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.step()
         return grad_norm
 
+    def _compute_grad_norm(self) -> float:
+        """Compute current accumulated gradient norm without modifying grads.
+        Uses clip_grad_norm_ with inf max_norm, which computes the norm and
+        applies a scale of min(inf/norm, 1.0) = 1.0, leaving grads unchanged.
+        """
+        return self._clip_grads(max_norm=float('inf'))
+
+    def _clip_grads(self, max_norm: float) -> float:
+        """Clip accumulated gradients in-place. Returns the pre-clip norm."""
+        if isinstance(self.actor_module, FSDP):
+            grad_norm = self.actor_module.clip_grad_norm_(max_norm=max_norm)
+        elif isinstance(self.actor_module, FSDPModule):
+            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=max_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=max_norm)
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
+        return grad_norm.item()
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -877,15 +897,30 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(sdpo_metrics)
                         micro_batch_metrics["actor/sdpo_loss"] = sdpo_loss.detach().item()
 
-                        # Optionally add RL policy gradient loss: L = L_sdpo + rl_loss_coef * L_RL
+                        # Optionally add RL policy gradient loss: L = sdpo_loss_coef * L_sdpo + rl_loss_coef * L_RL
                         rl_loss_coef = getattr(self_distillation_cfg, "rl_loss_coef", 0.0)
                         if rl_loss_coef > 0.0:
-                            rl_policy_loss_fn = get_policy_loss_fn("vanilla")
+                            # Optionally mask RL advantages by SDPO signal direction
+                            rl_advantages = advantages
+                            rl_response_mask = response_mask
+                            if getattr(self_distillation_cfg, "rl_advantage_sign_masking", False):
+                                with torch.no_grad():
+                                    adv_sign = torch.sign(advantages)
+                                    sdpo_sign = torch.sign(teacher_log_prob - log_prob)
+                                    sign_agree = (adv_sign == sdpo_sign).float()
+                                    rl_advantages = advantages * sign_agree
+                                    rl_response_mask = response_mask * sign_agree
+                                tokens_total = response_mask.sum().item()
+                                tokens_kept = rl_response_mask.sum().item()
+                                micro_batch_metrics["rl/adv_sign_mask_keep_ratio"] = tokens_kept / max(tokens_total, 1.0)
+
+                            rl_loss_mode = getattr(self_distillation_cfg, "rl_loss_mode", "vanilla")
+                            rl_policy_loss_fn = get_policy_loss_fn(rl_loss_mode)
                             rl_loss, rl_metrics = rl_policy_loss_fn(
                                 old_log_prob=old_log_prob,
                                 log_prob=log_prob,
-                                advantages=advantages,
-                                response_mask=response_mask,
+                                advantages=rl_advantages,
+                                response_mask=rl_response_mask,
                                 loss_agg_mode=loss_agg_mode,
                                 config=self.config,
                                 rollout_is_weights=rollout_is_weights,
@@ -894,9 +929,18 @@ class DataParallelPPOActor(BasePPOActor):
                                 micro_batch_metrics[f"rl/{k.split('/')[-1]}"] = v
                             micro_batch_metrics["actor/rl_loss"] = rl_loss.detach().item()
                             micro_batch_metrics["actor/rl_loss_coef"] = rl_loss_coef
-                            pg_loss = sdpo_loss + rl_loss_coef * rl_loss
+                            sdpo_loss_coef = getattr(self_distillation_cfg, "sdpo_loss_coef", 1.0)
+                            _rl_grad_balance = getattr(self_distillation_cfg, "rl_grad_balance", "none")
+                            if _rl_grad_balance == "log":
+                                # Separate backwards for grad norm logging
+                                pg_loss = sdpo_loss_coef * sdpo_loss
+                                _pending_rl_loss = rl_loss_coef * rl_loss
+                            else:
+                                pg_loss = sdpo_loss_coef * sdpo_loss + rl_loss_coef * rl_loss
+                                _pending_rl_loss = None
                         else:
                             pg_loss = sdpo_loss
+                            _pending_rl_loss = None
 
                         # Save detached values for teacher RL (needed after main backward)
                         if teacher_rl_loss_coef > 0.0:
@@ -919,6 +963,7 @@ class DataParallelPPOActor(BasePPOActor):
                             rollout_is_weights=rollout_is_weights,
                         )
                         micro_batch_metrics.update(pg_metrics)
+                        _pending_rl_loss = None
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -958,17 +1003,98 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    # Snapshot accumulated grads before SDPO backward so we can
+                    # isolate this micro-batch's SDPO contribution in match mode.
+                    pre_sdpo_snap = None
+                    _needs_grad_snap = (
+                        (self_distillation_enabled and teacher_rl_loss_coef > 0.0
+                         and getattr(self_distillation_cfg, "teacher_rl_grad_balance", "none") in ("match", "log"))
+                        or (_pending_rl_loss is not None)
+                    )
+                    if _needs_grad_snap:
+                        pre_sdpo_snap = {
+                            p: p.grad.clone() for p in self.actor_module.parameters() if p.grad is not None
+                        }
+
                     _t0 = time.monotonic()
+                    _retain = _pending_rl_loss is not None
                     if self.scaler is not None:
-                        self.scaler.scale(loss).backward()
+                        self.scaler.scale(loss).backward(retain_graph=_retain)
                     else:
-                        loss.backward()
+                        loss.backward(retain_graph=_retain)
                     _time_backward += time.monotonic() - _t0
+
+                    # Student RL grad norm logging (split backward)
+                    if _pending_rl_loss is not None:
+                        # Isolate this micro-batch's SDPO grads
+                        if pre_sdpo_snap:
+                            for p in self.actor_module.parameters():
+                                if p.grad is not None and p in pre_sdpo_snap:
+                                    p.grad.sub_(pre_sdpo_snap[p])
+                        sdpo_gn = self._compute_grad_norm()
+                        micro_batch_metrics["actor/sdpo_grad_norm"] = sdpo_gn
+                        # Restore accumulated + SDPO
+                        if pre_sdpo_snap:
+                            for p in self.actor_module.parameters():
+                                if p.grad is not None and p in pre_sdpo_snap:
+                                    p.grad.add_(pre_sdpo_snap[p])
+                        # Snapshot post-SDPO state
+                        post_sdpo_snap = {
+                            p: p.grad.clone() for p in self.actor_module.parameters() if p.grad is not None
+                        }
+                        # RL backward
+                        rl_scaled = _pending_rl_loss * loss_scale_factor
+                        if self.scaler is not None:
+                            self.scaler.scale(rl_scaled).backward()
+                        else:
+                            rl_scaled.backward()
+                        # Isolate RL grads
+                        for p in self.actor_module.parameters():
+                            if p.grad is not None and p in post_sdpo_snap:
+                                p.grad.sub_(post_sdpo_snap[p])
+                        rl_gn = self._compute_grad_norm()
+                        micro_batch_metrics["actor/rl_grad_norm"] = rl_gn
+                        # Restore combined grads
+                        for p in self.actor_module.parameters():
+                            if p.grad is not None and p in post_sdpo_snap:
+                                p.grad.add_(post_sdpo_snap[p])
+                        del post_sdpo_snap
 
                     # Teacher-context RL loss in a separate forward+backward.
                     # The main backward above freed the student graph, so peak memory
                     # is the same as a single forward pass.
                     if self_distillation_enabled and teacher_rl_loss_coef > 0.0:
+                        grad_balance = getattr(self_distillation_cfg, "teacher_rl_grad_balance", "none")
+
+                        # clip_sdpo: clip SDPO grads before teacher RL backward so SDPO
+                        # contribution is at a consistent norm regardless of domain.
+                        if grad_balance == "clip_sdpo":
+                            sdpo_gn = self._clip_grads(self.config.grad_clip)
+                            micro_batch_metrics["actor/sdpo_grad_norm"] = sdpo_gn
+
+                        # match: snapshot raw SDPO grads (no clip) to exactly decompose
+                        # and rescale the teacher RL contribution after its backward.
+                        sdpo_grad_snapshot = None
+                        if grad_balance in ("match", "log"):
+                            # Temporarily isolate current mb's SDPO grads by subtracting accumulated
+                            if pre_sdpo_snap:
+                                for p in self.actor_module.parameters():
+                                    if p.grad is not None and p in pre_sdpo_snap:
+                                        p.grad.sub_(pre_sdpo_snap[p])
+                            sdpo_gn = self._compute_grad_norm()
+                            micro_batch_metrics["actor/sdpo_grad_norm"] = sdpo_gn
+                            # Restore full accumulated + SDPO grads
+                            if pre_sdpo_snap:
+                                for p in self.actor_module.parameters():
+                                    if p.grad is not None and p in pre_sdpo_snap:
+                                        p.grad.add_(pre_sdpo_snap[p])
+                                del pre_sdpo_snap  # Free before allocating next snapshot
+
+                            # Snapshot post-SDPO state (accumulated + SDPO) for teacher RL isolation
+                            sdpo_grad_snapshot = {
+                                p: p.grad.clone() for p in self.actor_module.parameters() if p.grad is not None
+                            }
+
                         teacher_rl_outputs = self._forward_micro_batch(
                             teacher_inputs,
                             temperature=temperature,
@@ -992,11 +1118,55 @@ class DataParallelPPOActor(BasePPOActor):
                             rollout_is_weights=rollout_is_weights,
                         )
 
-                        teacher_rl_scaled = teacher_rl_loss_coef * teacher_rl_loss * loss_scale_factor
+                        # Optional forward KL: KL(teacher_ctx || student_ctx) via REINFORCE.q
+                        # Pulls the teacher-context distribution toward the student-context
+                        # distribution, helping the teacher track the reward-tilted student.
+                        add_fwd_kl_coef = getattr(self_distillation_cfg, "add_forward_kl_coef", 0.0)
+                        teacher_rl_total = teacher_rl_loss
+                        if add_fwd_kl_coef > 0.0:
+                            fwd_kl = (teacher_log_prob_with_grad - log_prob.detach()).detach() * teacher_log_prob_with_grad
+                            fwd_kl_loss = agg_loss(loss_mat=fwd_kl, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            teacher_rl_total = teacher_rl_total + add_fwd_kl_coef * fwd_kl_loss
+                            micro_batch_metrics["actor/teacher_forward_kl_loss"] = fwd_kl_loss.detach().item()
+
+                        teacher_rl_scaled = teacher_rl_loss_coef * teacher_rl_total * loss_scale_factor
                         if self.scaler is not None:
                             self.scaler.scale(teacher_rl_scaled).backward()
                         else:
                             teacher_rl_scaled.backward()
+
+                        if grad_balance == "clip_sdpo":
+                            total_gn = self._compute_grad_norm()
+                            micro_batch_metrics["actor/total_pre_clip_grad_norm"] = total_gn
+
+                        if grad_balance in ("match", "log") and sdpo_grad_snapshot is not None:
+                            # Isolate teacher RL grads: temporarily set .grad = g_t
+                            for p in self.actor_module.parameters():
+                                if p.grad is not None and p in sdpo_grad_snapshot:
+                                    p.grad.sub_(sdpo_grad_snapshot[p])
+                            # Compute ||g_t|| using FSDP-aware norm (handles sharded params correctly)
+                            trl_gn = self._compute_grad_norm()
+                            micro_batch_metrics["actor/teacher_rl_grad_norm"] = trl_gn
+
+                            if grad_balance == "match":
+                                # Rescale g_t to match ||g_s||, then restore: .grad = g_s + scale * g_t
+                                if trl_gn > 1e-8 and sdpo_gn > 1e-8:
+                                    scale = sdpo_gn / trl_gn
+                                    micro_batch_metrics["actor/trl_grad_match_scale"] = scale
+                                    for p in self.actor_module.parameters():
+                                        if p.grad is not None and p in sdpo_grad_snapshot:
+                                            p.grad.mul_(scale).add_(sdpo_grad_snapshot[p])
+                                else:
+                                    # Degenerate case: restore original combined grads
+                                    for p in self.actor_module.parameters():
+                                        if p.grad is not None and p in sdpo_grad_snapshot:
+                                            p.grad.add_(sdpo_grad_snapshot[p])
+                            else:
+                                # log mode: restore grads without rescaling
+                                for p in self.actor_module.parameters():
+                                    if p.grad is not None and p in sdpo_grad_snapshot:
+                                        p.grad.add_(sdpo_grad_snapshot[p])
+                            del sdpo_grad_snapshot
 
                         for k, v in teacher_rl_metrics.items():
                             micro_batch_metrics[f"teacher_rl/{k.split('/')[-1]}"] = v
