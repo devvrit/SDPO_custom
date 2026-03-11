@@ -1,0 +1,4 @@
+config.json
+.env
+queue/
+__pycache__/

@@ -1,0 +1,23 @@
+{
+  "provider": "meta",
+  "active_user": "your_name",
+  "users": {
+    "your_name": {
+      "name": "Your Name",
+      "phone": "15551234567"
+    }
+  },
+  "meta": {
+    "phone_number_id": "YOUR_PHONE_NUMBER_ID",
+    "access_token": "YOUR_ACCESS_TOKEN",
+    "verify_token": "YOUR_VERIFY_TOKEN"
+  },
+  "twilio": {
+    "account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "auth_token": "your_auth_token_here",
+    "wa_number": "whatsapp:+14155238886"
+  },
+  "port": 8000,
+  "response_timeout": 600,
+  "progress_interval": 30
+}

@@ -1,11 +1,18 @@
 #!/bin/bash
 
-# Word sorting SDPO + teacher co-training (cotrain) with Qwen3-1.7B.
+# Word sorting SDPO + CISPO student RL + teacher co-training with forward KL.
 #
-# Adds teacher RL (std_normalize_sdpo + teacher_rl_loss_coef) on top of
-# the base word_sorting.sh SDPO setup.
+# Extends word_sorting_sdpo_rl.sh by adding teacher RL co-training:
+#   - teacher_rl_loss_coef=0.1: teacher RL loss weight
+#   - add_forward_kl_coef=0.01: KL(teacher_ctx || student_ctx) regularization
+#   - std_normalize_sdpo=false: use full-vocab JSD (not REINFORCE surrogate)
 #
-# Usage: ./run_scripts/word_sorting_cotrain.sh [experiment_name_suffix]
+# Key settings matching grpo_cispo RL:
+#   - rl_loss_mode=cispo (not vanilla PPO)
+#   - clip_ratio_low=1.0, clip_ratio_high=3.0 (asymmetric [0, 4])
+#   - norm_adv_by_std_in_grpo=False (mean-centered only)
+#
+# Usage: ./run_scripts/word_sorting_sdpo_rl_cotrain.sh [experiment_name_suffix]
 # Note: MODEL_PATH and DATA_PATH can be set via environment (from submit.sh).
 
 # =============================================================================
@@ -59,7 +66,7 @@ elif [ -n "$JOB_NAME" ]; then
     EXP_NAME="$JOB_NAME"
 else
     MODEL_NAME=$(echo "$MODEL_PATH" | tr '/' '-')
-    EXP_NAME="LOCAL-WORDSORT-COTRAIN-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-${MODEL_NAME}-${SUFFIX}"
+    EXP_NAME="LOCAL-WORDSORT-SDPO-RL-COTRAIN-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-${MODEL_NAME}-${SUFFIX}"
 fi
 
 ARGS="data.train_batch_size=$TRAIN_BATCH_SIZE \
@@ -89,12 +96,20 @@ vars.log_dir=$LOG_DIR \
 vars.ckpt_dir=$CKPT_DIR \
 vars.task=$DATA_PATH \
 custom_reward_function.path=$CUSTOM_REWARD_PATH \
-actor_rollout_ref.actor.self_distillation.teacher_rl_loss_coef=1.0 \
-actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
+actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
+actor_rollout_ref.actor.self_distillation.rl_loss_mode=cispo \
+actor_rollout_ref.actor.self_distillation.sdpo_loss_coef=0.02 \
+actor_rollout_ref.actor.clip_ratio_low=1.0 \
+actor_rollout_ref.actor.clip_ratio_high=3.0 \
+algorithm.norm_adv_by_std_in_grpo=False \
+actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=false \
+actor_rollout_ref.actor.self_distillation.teacher_rl_loss_coef=0.1 \
+actor_rollout_ref.actor.self_distillation.add_forward_kl_coef=0.01"
 
 
 echo "----------------------------------------------------------------"
-echo "Starting Word Sorting SDPO Cotrain Training"
+echo "Starting Word Sorting SDPO+CISPO RL + Teacher Co-training"
 echo "Experiment: $EXP_NAME"
 echo "Data: $DATA_PATH"
 echo "Model: $MODEL_PATH"
