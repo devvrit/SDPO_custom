@@ -103,7 +103,7 @@ echo "----------------------------------------------------------------"
 # Append extra Hydra args if provided (e.g. offloading injected by submit.sh)
 FINAL_ARGS="$ARGS"
 if [ -n "$EXTRA_HYDRA_ARGS" ]; then
-    FINAL_ARGS="$ARGS $EXTRA_HYDRA_ARGS"
+    FINAL_ARGS="$ARGS $EXTRA_HYDRA_ARGS"L
     echo "Extra Hydra args: $EXTRA_HYDRA_ARGS"
 fi
 

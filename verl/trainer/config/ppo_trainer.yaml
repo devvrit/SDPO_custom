@@ -151,7 +151,7 @@ trainer:
 
   # Log ALL trajectories (prompts, responses, teacher prompts, rewards) per step
   # Saves JSONL files to {ckpt_dir}/{exp_name}/trajectories/ and logs wandb Tables
-  log_all_trajectories: false
+  log_all_trajectories: true
 
   # Number of nodes used in the training
   nnodes: 1

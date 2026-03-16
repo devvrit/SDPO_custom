@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import signal
 from collections import defaultdict
 from typing import Any
 
@@ -22,18 +21,6 @@ from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
-
-# Per-sample timeout for reward computation (seconds).
-# If a single sample's scoring takes longer than this, it is killed and scored 0.
-_REWARD_TIMEOUT_S = 30
-
-
-class _RewardTimeout(Exception):
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise _RewardTimeout()
 
 
 @register("naive")
@@ -106,26 +93,12 @@ class NaiveRewardManager(AbstractRewardManager):
                 (valid_response_ids == eid).any().item() for eid in eos_ids
             )
 
-            # Use SIGALRM timeout to prevent individual scoring from hanging
-            # (e.g. ZSS tree-edit-distance on pathological JSON structures)
-            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(_REWARD_TIMEOUT_S)
-            try:
-                score = self.compute_score(
-                    data_source=data_source,
-                    solution_str=response_str,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                )
-            except _RewardTimeout:
-                print(
-                    f"[NaiveRewardManager] WARNING: reward computation timed out after {_REWARD_TIMEOUT_S}s "
-                    f"for sample {i} (data_source={data_source}), scoring as 0"
-                )
-                score = {"score": 0.0, "acc": 0.0, "pred": "", "feedback": "Reward computation timed out", "incorrect_format": 0}
-            finally:
-                signal.alarm(0)  # cancel the alarm
-                signal.signal(signal.SIGALRM, old_handler)
+            score = self.compute_score(
+                data_source=data_source,
+                solution_str=response_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
 
             if isinstance(score, dict):
                 reward = score["score"]

@@ -116,6 +116,7 @@ class SelfDistillationConfig(BaseConfig):
     sdpo_loss_coef: float = 1.0  # Weight for SDPO loss (set to 0 for pure masked-RL without SDPO loss)
     add_forward_kl_coef: float = 0.0  # Adds KL(student || teacher) to SDPO loss; 0 = disabled
     use_dataset_solution: bool = False  # When True, use dataset's reference_solution field as teacher's privileged info (OPSD mode)
+    anti_hallucination_system_prompt: bool = False  # When True, prepend a system prompt to teacher that instructs it not to leak privileged info
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

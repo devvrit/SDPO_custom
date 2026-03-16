@@ -99,13 +99,13 @@ custom_reward_function.path=$CUSTOM_REWARD_PATH \
 actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
 actor_rollout_ref.actor.self_distillation.rl_loss_mode=cispo \
-actor_rollout_ref.actor.self_distillation.sdpo_loss_coef=0.02 \
+actor_rollout_ref.actor.self_distillation.sdpo_loss_coef=0.002 \
 actor_rollout_ref.actor.clip_ratio_low=1.0 \
 actor_rollout_ref.actor.clip_ratio_high=3.0 \
 algorithm.norm_adv_by_std_in_grpo=False \
 actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=false \
-actor_rollout_ref.actor.self_distillation.teacher_rl_loss_coef=0.1 \
-actor_rollout_ref.actor.self_distillation.add_forward_kl_coef=0.01"
+actor_rollout_ref.actor.self_distillation.teacher_rl_loss_coef=1 \
+actor_rollout_ref.actor.self_distillation.add_forward_kl_coef=0"
 
 
 echo "----------------------------------------------------------------"

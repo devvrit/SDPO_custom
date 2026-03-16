@@ -57,6 +57,10 @@ forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
 # Kept for backward compatibility.
 reward_manager: naive
 
+# Number of parallel workers for PrimeRewardManager (ThreadPoolExecutor threads).
+# Each worker scores one solution at a time. Set to roughly the number of free CPU cores.
+reward_num_workers: 64
+
 # Reward Loop Loading Configuration (for experimental reward system)
 # Source for loading reward loop manager: "register" (default) or "importlib"
 reward_loop_source: register

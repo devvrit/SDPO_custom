@@ -1,18 +1,33 @@
 #!/bin/bash
 
-# Word sorting SDPO + teacher co-training (cotrain) with Qwen3-1.7B.
+# Word sorting SDPO + CISPO student RL + teacher co-training — THINKING MODE enabled.
 #
-# Adds teacher RL (std_normalize_sdpo + teacher_rl_loss_coef) on top of
-# the base word_sorting.sh SDPO setup.
+# Combines word_sorting_sdpo_rl_cotrain.sh with thinking-mode settings:
+#   - enable_thinking=true via apply_chat_template_kwargs
+#   - Config: sdpo_think (thinking-appropriate reprompt templates)
+#   - max_response_length: 1024 → 8192 (thinking generates far more tokens)
+#   - max_prompt_length: 512 (unchanged, word sorting prompts are short)
+#   - max_model_len: 16384 (accommodates reprompt + thinking response)
+#   - max_reprompt_len: 4096
 #
-# Usage: ./run_scripts/word_sorting_cotrain.sh [experiment_name_suffix]
+# Key settings matching grpo_cispo RL:
+#   - rl_loss_mode=cispo (not vanilla PPO)
+#   - clip_ratio_low=1.0, clip_ratio_high=3.0 (asymmetric [0, 4])
+#   - norm_adv_by_std_in_grpo=False (mean-centered only)
+#
+# Co-training additions:
+#   - teacher_rl_loss_coef=1: teacher RL loss weight
+#   - add_forward_kl_coef=0: KL(teacher_ctx || student_ctx) regularization
+#   - std_normalize_sdpo=false: use full-vocab JSD (not REINFORCE surrogate)
+#
+# Usage: ./run_scripts/word_sorting_sdpo_rl_cotrain_think.sh [experiment_name_suffix]
 # Note: MODEL_PATH and DATA_PATH can be set via environment (from submit.sh).
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-CONFIG_NAME="sdpo"
+CONFIG_NAME="sdpo_think"
 
 DATA_PATH="${DATA_PATH:-datasets/word_sorting}"
 
@@ -26,6 +41,12 @@ DONTS_REPROMPT_ON_SELF_SUCCESS=True
 ALPHA=1.0
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-1.7B}"
 export N_GPUS_PER_NODE=8
+
+# Thinking-mode sequence lengths
+MAX_RESPONSE_LENGTH=8192
+MAX_PROMPT_LENGTH=512
+MAX_MODEL_LEN=16384       # prompt + reprompt + thinking response
+MAX_REPROMPT_LEN=4096     # word sorting reprompts are short
 
 # =============================================================================
 # SETUP
@@ -59,7 +80,7 @@ elif [ -n "$JOB_NAME" ]; then
     EXP_NAME="$JOB_NAME"
 else
     MODEL_NAME=$(echo "$MODEL_PATH" | tr '/' '-')
-    EXP_NAME="LOCAL-WORDSORT-COTRAIN-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-${MODEL_NAME}-${SUFFIX}"
+    EXP_NAME="LOCAL-WORDSORT-SDPO-RL-COTRAIN-THINK-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-${MODEL_NAME}-${SUFFIX}"
 fi
 
 ARGS="data.train_batch_size=$TRAIN_BATCH_SIZE \
@@ -81,24 +102,40 @@ actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.01 \
 actor_rollout_ref.actor.self_distillation.success_reward_threshold=1.0 \
 actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
 actor_rollout_ref.rollout.val_kwargs.n=4 \
-data.max_response_length=1024 \
-data.max_prompt_length=512 \
-max_model_len=2048 \
+data.max_response_length=$MAX_RESPONSE_LENGTH \
+data.max_prompt_length=$MAX_PROMPT_LENGTH \
+data.apply_chat_template_kwargs={enable_thinking:true} \
+max_model_len=$MAX_MODEL_LEN \
+actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_REPROMPT_LEN \
 vars.dir=$BASE_DIR \
 vars.log_dir=$LOG_DIR \
 vars.ckpt_dir=$CKPT_DIR \
 vars.task=$DATA_PATH \
 custom_reward_function.path=$CUSTOM_REWARD_PATH \
-actor_rollout_ref.actor.self_distillation.teacher_rl_loss_coef=1.0 \
-actor_rollout_ref.actor.self_distillation.sdpo_loss_coef=0.002 \
-actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
+data.val_files=[\${vars.dir}/\${vars.task}/test.parquet] \
+actor_rollout_ref.actor.self_distillation.rl_loss_coef=1.0 \
+actor_rollout_ref.actor.self_distillation.rl_loss_mode=cispo \
+actor_rollout_ref.actor.self_distillation.sdpo_loss_coef=0.02 \
+actor_rollout_ref.actor.clip_ratio_low=1.0 \
+actor_rollout_ref.actor.clip_ratio_high=3.0 \
+algorithm.norm_adv_by_std_in_grpo=False \
+actor_rollout_ref.actor.self_distillation.std_normalize_sdpo=false \
+actor_rollout_ref.actor.self_distillation.teacher_rl_loss_coef=1 \
+actor_rollout_ref.actor.self_distillation.add_forward_kl_coef=0"
 
 
 echo "----------------------------------------------------------------"
-echo "Starting Word Sorting SDPO Cotrain Training"
+echo "Starting Word Sorting SDPO+CISPO RL + Teacher Co-training (THINKING MODE)"
 echo "Experiment: $EXP_NAME"
 echo "Data: $DATA_PATH"
 echo "Model: $MODEL_PATH"
+echo "Config: $CONFIG_NAME"
+echo "enable_thinking: true"
+echo "max_response_length: $MAX_RESPONSE_LENGTH"
+echo "max_prompt_length: $MAX_PROMPT_LENGTH"
+echo "max_model_len: $MAX_MODEL_LEN"
+echo "max_reprompt_len: $MAX_REPROMPT_LEN"
 echo "----------------------------------------------------------------"
 
 FINAL_ARGS="$ARGS"

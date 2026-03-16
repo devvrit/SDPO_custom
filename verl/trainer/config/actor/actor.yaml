@@ -205,6 +205,10 @@ self_distillation:
   # privileged information (OPSD mode) instead of successful rollouts.
   use_dataset_solution: false
 
+  # When true, prepend a system prompt to teacher that instructs it not to
+  # leak privileged info (reduces student hallucination of feedback)
+  anti_hallucination_system_prompt: false
+
   # Prompt templates - canonical source of truth is verl/workers/config/actor.py
   # These must be present for Hydra struct mode. Keep in sync with actor.py.
   reprompt_template: "{prompt}{solution}{feedback}\n\nNow solve the original problem in a fresh way. Do not mention or refer to the critique or the revision process. Use the feedback/critique only to improve correctness, clarity, and reasoning. Avoid using phrases like \"Correctly applying the critique...\" or \"Reexamining my earlier solution...\", \"Given correct answer:..\", \"They gave reference solution/feecback:..\" etc., as the final answer should stand alone. Basically, reading your thought process and summarized solution, it should not be apparent that you had access to privileged information, though you can use and refer the privileged information to help guide your attempt. Now let's think step by step and output the final answer within \\boxed{{}}.\n"

@@ -1065,8 +1065,16 @@ class RayPPOTrainer:
                 for i in range(batch_size)
             ]
 
+        # Anti-hallucination system prompt: prepend to teacher messages
+        use_anti_halluc = self_distillation_cfg.get("anti_hallucination_system_prompt", False)
+        if use_anti_halluc:
+            from verl.utils.anti_hallucination_prompt import ANTI_HALLUCINATION_SYSTEM_PROMPT
+            _anti_halluc_msg = {"role": "system", "content": ANTI_HALLUCINATION_SYSTEM_PROMPT}
+
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+            if use_anti_halluc:
+                system_messages = [_anti_halluc_msg] + list(system_messages)
 
             if use_external and feedback_list[i] is not None:
                 # Use the proxy teacher template (matching tinker codebase):

@@ -20,9 +20,9 @@ EVAL_DIR="/fsx/ubuntu/repos/SDPO_custom/hallucination_eval"
 
 # --- Configuration ---
 # Which experiment to evaluate (think or nothink)
-TRAJ_DIR="/fsx/ubuntu/repos/SDPO_custom/ttrl_runs/tooluse-general_think-qwen3-8b-ml.p5e.48xlarge-tooluse_sdpo_nothink/trajectories"
-OUTPUT="${EVAL_DIR}/results_nothink.csv"
-STRIDE=20       # evaluate every 20th step (1311 files, keep cost reasonable)
+TRAJ_DIR="/fsx/ubuntu/repos/SDPO_custom/ttrl_runs/codeio-codeio_mini_sdpo_rl-qwen3-1.7b-ml.p4de.24xlarge-v1_sdpo_rl_loggen/trajectories"
+OUTPUT="${EVAL_DIR}/results_codeio_sdpo_rl.csv"
+STRIDE=10       # evaluate every 10th step (469 files)
 MAX_SAMPLES=64  # per step (0 = all 256)
 
 echo "Starting hallucination evaluation..."
