@@ -682,6 +682,39 @@ class RayPPOTrainer:
 
             wandb.log({"debug/teacher_traces": teacher_table}, step=step)
 
+        # If feedback SFT is active, log feedback prediction traces
+        if "feedback_sft_input_ids" in batch.batch:
+            fb_table = wandb.Table(columns=["step", "uid", "sample_idx", "acc", "feedback_sft_full_raw", "feedback_sft_target"])
+            fb_input_ids = batch.batch["feedback_sft_input_ids"]
+            fb_attn_mask = batch.batch["feedback_sft_attention_mask"]
+            fb_labels = batch.batch["feedback_sft_labels"]
+            fb_sample_mask = batch.batch["feedback_sft_mask"]
+
+            for i in selected_indices:
+                if fb_sample_mask[i].item() < 0.5:
+                    continue  # skip samples without feedback
+
+                # Decode full sequence (with special tokens for debugging)
+                fb_ids = fb_input_ids[i][fb_attn_mask[i].bool()]
+                fb_full_raw = self.tokenizer.decode(fb_ids, skip_special_tokens=False)
+
+                # Decode just the SFT target (feedback tokens)
+                target_mask = fb_labels[i] != -100
+                if target_mask.any():
+                    target_ids = fb_labels[i][target_mask]
+                    fb_target = self.tokenizer.decode(target_ids, skip_special_tokens=True)
+                else:
+                    fb_target = ""
+
+                if has_acc:
+                    acc = float(batch.non_tensor_batch["acc"][i])
+                else:
+                    acc = float(batch.batch["token_level_scores"][i].sum().item())
+
+                fb_table.add_data(step, str(uids[i]), i, acc, fb_full_raw, fb_target)
+
+            wandb.log({"debug/feedback_sft_traces": fb_table}, step=step)
+
     def _log_all_trajectories(self, batch: DataProto, step: int):
         """Log ALL trajectories to JSONL files and wandb Tables.
 
@@ -1226,12 +1259,119 @@ class RayPPOTrainer:
             if ext_fb_time is not None:
                 metrics["self_distillation/external_feedback_api_time_sec"] = ext_fb_time
 
-        return DataProto.from_dict(tensors={
+        # --- Feedback prediction SFT input construction ---
+        feedback_sft_loss_coef = self_distillation_cfg.get("feedback_sft_loss_coef", 0.0)
+        feedback_sft_data = {}
+        if feedback_sft_loss_coef > 0.0:
+            feedback_sft_prompt_text = self_distillation_cfg.get("feedback_sft_prompt", "")
+            if not feedback_sft_prompt_text:
+                raise ValueError(
+                    "feedback_sft_prompt must be set when feedback_sft_loss_coef > 0"
+                )
+
+            # Build full messages (with feedback as final assistant turn)
+            # and prefix messages (without feedback) for each sample.
+            # Thinking is enabled to match rollout tokenization, but we prepend
+            # </think>\n to the feedback content so the model learns to skip
+            # thinking and output feedback directly.
+            full_messages_list = []
+            prefix_messages_list = []
+            has_feedback = []
+            for i in range(batch_size):
+                fb = feedback_list[i]
+                sys_msgs = list(batch.non_tensor_batch["raw_prompt"][i][:-1])
+                if fb and isinstance(fb, str) and fb.strip():
+                    full_msgs = sys_msgs + [
+                        {"role": "user", "content": prompt_texts[i]},
+                        {"role": "assistant", "content": response_texts[i]},
+                        {"role": "user", "content": feedback_sft_prompt_text},
+                        {"role": "assistant", "content": "</think>\n" + fb},
+                    ]
+                    prefix_msgs = sys_msgs + [
+                        {"role": "user", "content": prompt_texts[i]},
+                        {"role": "assistant", "content": response_texts[i]},
+                        {"role": "user", "content": feedback_sft_prompt_text},
+                    ]
+                    full_messages_list.append(full_msgs)
+                    prefix_messages_list.append(prefix_msgs)
+                    has_feedback.append(True)
+                else:
+                    # Placeholder — will be masked out by fb_sft_sample_mask
+                    placeholder = sys_msgs + [
+                        {"role": "user", "content": prompt_texts[i]},
+                    ]
+                    full_messages_list.append(placeholder)
+                    prefix_messages_list.append(placeholder)
+                    has_feedback.append(False)
+
+            # Tokenize full sequences (feedback is a complete assistant turn)
+            full_tok = self.tokenizer.apply_chat_template(
+                full_messages_list,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                continue_final_message=False,
+                add_generation_prompt=False,
+                enable_thinking=enable_thinking,
+                max_length=self_distillation_cfg.max_reprompt_len,
+                padding=True,
+                truncation=True,
+            )
+            # Tokenize prefix (everything before the feedback) to find where
+            # the SFT target tokens start
+            prefix_tok = self.tokenizer.apply_chat_template(
+                prefix_messages_list,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                continue_final_message=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                max_length=self_distillation_cfg.max_reprompt_len,
+                padding=True,
+                truncation=True,
+            )
+
+            full_ids = full_tok["input_ids"].to(device)
+            full_mask = full_tok["attention_mask"].to(device)
+
+            # Build labels: -100 for prefix tokens, actual token ids for feedback tokens
+            prefix_lengths = prefix_tok["attention_mask"].sum(dim=1)  # (batch_size,)
+            labels = torch.full_like(full_ids, -100)
+            for i in range(batch_size):
+                if has_feedback[i]:
+                    plen = prefix_lengths[i].item()
+                    valid_len = full_mask[i].sum().item()
+                    if plen < valid_len:
+                        labels[i, plen:valid_len] = full_ids[i, plen:valid_len]
+
+            fb_position_ids = compute_position_id_with_mask(full_mask)
+            fb_sft_sample_mask = torch.tensor(has_feedback, dtype=torch.float32, device=device)
+
+            feedback_sft_data = {
+                "feedback_sft_input_ids": full_ids,
+                "feedback_sft_attention_mask": full_mask,
+                "feedback_sft_position_ids": fb_position_ids,
+                "feedback_sft_labels": labels,
+                "feedback_sft_mask": fb_sft_sample_mask,
+            }
+
+            # Metrics
+            n_fb = sum(has_feedback)
+            metrics["feedback_sft/samples_with_feedback"] = n_fb
+            metrics["feedback_sft/fraction_with_feedback"] = n_fb / batch_size
+            if n_fb > 0:
+                fb_token_counts = [(labels[i] != -100).sum().item() for i in range(batch_size) if has_feedback[i]]
+                metrics["feedback_sft/avg_feedback_tokens"] = sum(fb_token_counts) / len(fb_token_counts)
+
+        result_tensors = {
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
-        }), metrics
+        }
+        result_tensors.update(feedback_sft_data)
+        return DataProto.from_dict(tensors=result_tensors), metrics
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt", "reference_solution"}) & batch.non_tensor_batch.keys()

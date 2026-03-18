@@ -209,6 +209,16 @@ self_distillation:
   # leak privileged info (reduces student hallucination of feedback)
   anti_hallucination_system_prompt: false
 
+  # Weight for feedback-prediction SFT auxiliary loss (0 = disabled).
+  # When >0, the model is trained to predict the environment feedback for its
+  # own answer. Input: [prompt + response + critique_prompt]. Target: true feedback tokens.
+  feedback_sft_loss_coef: 0.0
+
+  # Critique prompt inserted between the model's response and the true feedback.
+  # The model sees [prompt][response][this prompt] and is SFT'd to produce [true feedback].
+  # Pass domain-specific prompts via the run script.
+  feedback_sft_prompt: ""
+
   # Prompt templates - canonical source of truth is verl/workers/config/actor.py
   # These must be present for Hydra struct mode. Keep in sync with actor.py.
   reprompt_template: "{prompt}{solution}{feedback}\n\nNow solve the original problem in a fresh way. Do not mention or refer to the critique or the revision process. Use the feedback/critique only to improve correctness, clarity, and reasoning. Avoid using phrases like \"Correctly applying the critique...\" or \"Reexamining my earlier solution...\", \"Given correct answer:..\", \"They gave reference solution/feecback:..\" etc., as the final answer should stand alone. Basically, reading your thought process and summarized solution, it should not be apparent that you had access to privileged information, though you can use and refer the privileged information to help guide your attempt. Now let's think step by step and output the final answer within \\boxed{{}}.\n"

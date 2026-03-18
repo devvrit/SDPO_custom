@@ -117,6 +117,8 @@ class SelfDistillationConfig(BaseConfig):
     add_forward_kl_coef: float = 0.0  # Adds KL(student || teacher) to SDPO loss; 0 = disabled
     use_dataset_solution: bool = False  # When True, use dataset's reference_solution field as teacher's privileged info (OPSD mode)
     anti_hallucination_system_prompt: bool = False  # When True, prepend a system prompt to teacher that instructs it not to leak privileged info
+    feedback_sft_loss_coef: float = 0.0  # Weight for feedback-prediction SFT loss (0 = disabled)
+    feedback_sft_prompt: str = ""  # Critique prompt appended after model response; true feedback is the SFT target
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

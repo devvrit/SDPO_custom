@@ -741,6 +741,15 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
+        # Include feedback SFT keys if present
+        if self_distillation_enabled and "feedback_sft_input_ids" in data.batch.keys():
+            select_keys.extend([
+                "feedback_sft_input_ids",
+                "feedback_sft_attention_mask",
+                "feedback_sft_position_ids",
+                "feedback_sft_labels",
+                "feedback_sft_mask",
+            ])
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -941,6 +950,45 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             pg_loss = sdpo_loss
                             _pending_rl_loss = None
+
+                        # Feedback prediction SFT loss
+                        _fb_sft_coef = getattr(self_distillation_cfg, "feedback_sft_loss_coef", 0.0)
+                        if _fb_sft_coef > 0.0 and "feedback_sft_input_ids" in model_inputs:
+                            fb_input_ids = model_inputs["feedback_sft_input_ids"]
+                            fb_attn_mask = model_inputs["feedback_sft_attention_mask"]
+                            fb_pos_ids = model_inputs["feedback_sft_position_ids"]
+                            fb_labels = model_inputs["feedback_sft_labels"]
+                            fb_sample_mask = model_inputs["feedback_sft_mask"]
+
+                            # Forward pass through student model (with gradients)
+                            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+                                fb_outputs = self.actor_module(
+                                    input_ids=fb_input_ids,
+                                    attention_mask=fb_attn_mask,
+                                    position_ids=fb_pos_ids,
+                                )
+                                fb_logits = fb_outputs.logits  # (bsz, seq_len, vocab_size)
+
+                            # Shift for next-token prediction: logits[:, :-1] predicts labels[:, 1:]
+                            shift_logits = fb_logits[:, :-1, :].contiguous()
+                            shift_labels = fb_labels[:, 1:].contiguous()
+
+                            fb_ce_loss = torch.nn.functional.cross_entropy(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1),
+                                ignore_index=-100,
+                                reduction='none',
+                            ).view(shift_labels.shape)  # (bsz, seq_len-1)
+
+                            # Mean over valid tokens per sample, then mean over samples with feedback
+                            valid_token_mask = (shift_labels != -100).float()
+                            per_sample_loss = (fb_ce_loss * valid_token_mask).sum(dim=1) / valid_token_mask.sum(dim=1).clamp(min=1.0)
+                            fb_sft_loss = (per_sample_loss * fb_sample_mask).sum() / fb_sample_mask.sum().clamp(min=1.0)
+
+                            pg_loss = pg_loss + _fb_sft_coef * fb_sft_loss
+
+                            micro_batch_metrics["actor/feedback_sft_loss"] = fb_sft_loss.detach().item()
+                            micro_batch_metrics["actor/feedback_sft_loss_coef"] = _fb_sft_coef
 
                         # Save detached values for teacher RL (needed after main backward)
                         if teacher_rl_loss_coef > 0.0:
