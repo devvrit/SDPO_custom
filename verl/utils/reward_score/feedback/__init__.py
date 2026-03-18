@@ -22,7 +22,7 @@ def compute_score(
     elif data_source in ["sciknoweval"]:
         results = mcq.compute_score(solution_str, ground_truth)
     elif data_source in ["tooluse"]:
-        results = tooluse.compute_score(solution_str, ground_truth)
+        results = tooluse.compute_score(solution_str, ground_truth, extra_info)
     elif data_source in ["codeio"]:
         results = codeio.compute_score(solution_str, ground_truth, extra_info)
     elif data_source in ["word_sorting"]:
