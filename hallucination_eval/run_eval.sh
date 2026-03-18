@@ -14,7 +14,8 @@ set -e
 eval "$(conda shell.bash hook)"
 conda activate sdpo
 
-export OPENAI_API_KEY="your-key-here"
+# Set OPENAI_API_KEY in your environment before running this script
+# export OPENAI_API_KEY="your-key-here"
 
 EVAL_DIR="/fsx/ubuntu/repos/SDPO_custom/hallucination_eval"
 
